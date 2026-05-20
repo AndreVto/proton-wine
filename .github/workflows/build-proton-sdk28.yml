@@ -2,9 +2,9 @@ name: Build Proton Wine (SDK 28)
 
 on:
   push:
-    branches: [ main, master, proton_11.0 ]
+    branches: [ main, master, proton_11.0b5 ]
   pull_request:
-    branches: [ main, master, proton_11.0 ]
+    branches: [ main, master, proton_11.0b5 ]
   workflow_dispatch:
 
 jobs:
@@ -241,7 +241,7 @@ jobs:
   release:
     needs: build
     runs-on: ubuntu-24.04
-    if: (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || github.ref == 'refs/heads/proton_11.0')) || github.event_name == 'workflow_dispatch'
+    if: (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || github.ref == 'refs/heads/proton_11.0b5')) || github.event_name == 'workflow_dispatch'
     
     steps:
       - name: Download all artifacts
@@ -259,8 +259,9 @@ jobs:
       - name: Generate date-based tag
         id: generate_tag
         run: |
+          BRANCH=${GITHUB_REF_NAME}
           DATE=$(date +%Y%m%d)
-          TAG_NAME="build-p11-${DATE}-sdk28"
+          TAG_NAME="build-${BRANCH}-${DATE}-sdk28"
           echo "tag_name=${TAG_NAME}" >> $GITHUB_OUTPUT
           echo "Generated tag: ${TAG_NAME}"
       
@@ -277,7 +278,7 @@ jobs:
             
             ## Proton Wine Build based on Valve [Wine](https://github.com/ValveSoftware/wine/tree/proton_11.0)
             
-            ### Proton Version: 11.0-1
+            ### Proton Version: 11.0 beta 5
             
             Built from commit: ${{ github.sha }}
             
