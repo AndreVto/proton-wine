@@ -1,0 +1,13 @@
+diff --git a/dlls/wineaaudio.drv/Makefile.in b/dlls/wineaaudio.drv/Makefile.in
+new file mode 100644
+index 00000000000..ec470927996
+--- /dev/null
++++ b/dlls/wineaaudio.drv/Makefile.in
+@@ -0,0 +1,7 @@
++MODULE = wineaaudio.drv
++UNIXLIB = wineaaudio.so
++IMPORTS = dxguid uuid winmm user32 advapi32 ole32
++UNIX_LIBS = $(AAUDIO_LIBS) $(PTHREAD_LIBS) -lm
++
++SOURCES = \
++	aaudio.c

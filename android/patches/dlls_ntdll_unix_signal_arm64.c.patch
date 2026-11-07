@@ -1,0 +1,58 @@
+diff --git a/dlls/ntdll/unix/signal_arm64.c b/dlls/ntdll/unix/signal_arm64.c
+index c18e650..e09f5f1 100644
+--- a/dlls/ntdll/unix/signal_arm64.c
++++ b/dlls/ntdll/unix/signal_arm64.c
+@@ -213,6 +213,8 @@ struct syscall_frame
+ 
+ C_ASSERT( sizeof( struct syscall_frame ) == 0x330 );
+ 
++static const ULONG cpsr_host_mask = ~cpsr_user_mask | 0x1000;
++
+ 
+ /***********************************************************************
+  *           context_init_empty_xstate
+@@ -313,7 +315,7 @@ static void save_context( CONTEXT *context, const ucontext_t *sigcontext )
+     context->Lr   = LR_sig(sigcontext);     /* Link register */
+     context->Sp   = SP_sig(sigcontext);     /* Stack pointer */
+     context->Pc   = PC_sig(sigcontext);     /* Program Counter */
+-    context->Cpsr = PSTATE_sig(sigcontext); /* Current State Register */
++    context->Cpsr = PSTATE_sig(sigcontext) & cpsr_user_mask; /* Current State Register */
+     for (i = 0; i <= 28; i++) context->X[i] = REGn_sig( i, sigcontext );
+     save_fpu( context, sigcontext );
+ }
+@@ -332,7 +334,7 @@ static void restore_context( const CONTEXT *context, ucontext_t *sigcontext )
+     LR_sig(sigcontext)     = context->Lr;   /* Link register */
+     SP_sig(sigcontext)     = context->Sp;   /* Stack pointer */
+     PC_sig(sigcontext)     = context->Pc;   /* Program Counter */
+-    PSTATE_sig(sigcontext) = context->Cpsr; /* Current State Register */
++    PSTATE_sig(sigcontext) = (PSTATE_sig(sigcontext) & cpsr_host_mask) | (context->Cpsr & ~cpsr_host_mask);
+     for (i = 0; i <= 28; i++) REGn_sig( i, sigcontext ) = context->X[i];
+     restore_fpu( context, sigcontext );
+ }
+@@ -425,7 +427,7 @@ NTSTATUS WINAPI NtSetContextThread( HANDLE handle, const CONTEXT *context )
+         frame->lr    = context->Lr;
+         frame->sp    = context->Sp;
+         frame->pc    = context->Pc;
+-        frame->cpsr  = context->Cpsr;
++        frame->cpsr  = context->Cpsr & cpsr_user_mask;
+     }
+     if (flags & CONTEXT_FLOATING_POINT)
+     {
+@@ -594,7 +596,7 @@ NTSTATUS set_thread_wow64_context( HANDLE handle, const void *ctx, ULONG size )
+             wow_frame->Sp = context->Sp;
+             wow_frame->Lr = context->Lr;
+             wow_frame->Pc = context->Pc & ~1;
+-            wow_frame->Cpsr = context->Cpsr;
++            wow_frame->Cpsr = context->Cpsr & cpsr_user_mask;
+             if (context->Cpsr & 0x20) wow_frame->Pc |= 1; /* thumb */
+         }
+         if (flags & CONTEXT_FLOATING_POINT)
+@@ -1385,7 +1387,7 @@ static void usr2_handler( int signal, siginfo_t *siginfo, void *sigcontext )
+     LR_sig(context)     = frame->lr;
+     SP_sig(context)     = frame->sp;
+     PC_sig(context)     = frame->pc;
+-    PSTATE_sig(context) = frame->cpsr;
++    PSTATE_sig(context) = (PSTATE_sig(context) & cpsr_host_mask) | (frame->cpsr & ~cpsr_host_mask);
+     for (i = 0; i <= 28; i++) REGn_sig( i, context ) = frame->x[i];
+ 
+ #ifdef linux

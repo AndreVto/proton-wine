@@ -1,0 +1,57 @@
+diff --git a/dlls/mmdevapi/main.c b/dlls/mmdevapi/main.c
+index 66a63275f51..d084c7d7b45 100644
+--- a/dlls/mmdevapi/main.c
++++ b/dlls/mmdevapi/main.c
+@@ -128,22 +128,41 @@ static BOOL WINAPI init_driver(INIT_ONCE *once, void *param, void **context)
+     static WCHAR default_list[] = L"pulse,alsa,oss,coreaudio";
+     DriverFuncs driver;
+     HKEY key;
+-    WCHAR reg_list[256], *p, *next, *driver_list = default_list;
++    WCHAR env_list[256], reg_list[256], *p, *next, *driver_list = default_list;
++    DWORD env_len;
+ 
+-    if(RegOpenKeyW(HKEY_CURRENT_USER, drv_keyW, &key) == ERROR_SUCCESS){
+-        DWORD size = sizeof(reg_list);
++    env_len = GetEnvironmentVariableW(L"WINE_AUDIO_DRIVER", env_list, ARRAY_SIZE(env_list));
++    if (env_len && env_len < ARRAY_SIZE(env_list))
++    {
++        if (!wcscmp(env_list, L"none"))
++        {
++            TRACE("WINE_AUDIO_DRIVER explicitly disabled audio\n");
++            return TRUE;
++        }
++
++        driver_list = env_list;
++        TRACE("Using WINE_AUDIO_DRIVER=%s\n", wine_dbgstr_w(driver_list));
++    }
++    else
++    {
++        if (env_len >= ARRAY_SIZE(env_list))
++            WARN("Ignoring overlong WINE_AUDIO_DRIVER value\n");
++
++        if(RegOpenKeyW(HKEY_CURRENT_USER, drv_keyW, &key) == ERROR_SUCCESS){
++            DWORD size = sizeof(reg_list);
+ 
+-        if(RegQueryValueExW(key, L"Audio", 0, NULL, (BYTE*)reg_list, &size) == ERROR_SUCCESS){
+-            if(reg_list[0] == '\0'){
+-                TRACE("User explicitly chose no driver\n");
+-                RegCloseKey(key);
+-                return TRUE;
++            if(RegQueryValueExW(key, L"Audio", 0, NULL, (BYTE*)reg_list, &size) == ERROR_SUCCESS){
++                if(reg_list[0] == '\0'){
++                    TRACE("User explicitly chose no driver\n");
++                    RegCloseKey(key);
++                    return TRUE;
++                }
++
++                driver_list = reg_list;
+             }
+ 
+-            driver_list = reg_list;
++            RegCloseKey(key);
+         }
+-
+-        RegCloseKey(key);
+     }
+ 
+     TRACE("Loading driver list %s\n", wine_dbgstr_w(driver_list));

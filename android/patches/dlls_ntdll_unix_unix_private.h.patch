@@ -1,0 +1,33 @@
+diff --git a/dlls/ntdll/unix/unix_private.h b/dlls/ntdll/unix/unix_private.h
+index 2f649ca399e..f98429519e4 100644
+--- a/dlls/ntdll/unix/unix_private.h
++++ b/dlls/ntdll/unix/unix_private.h
+@@ -117,6 +117,9 @@ struct ntdll_thread_data
+     void                     *param;         /* thread entry point parameter */
+     void                     *jmp_buf;       /* setjmp buffer for exception handling */
+     int                      *fsync_apc_futex;
++#ifdef __ANDROID__
++    unsigned int              fsync_apc_drm_handle;
++#endif
+ };
+ 
+ C_ASSERT( sizeof(struct ntdll_thread_data) <= sizeof(((TEB *)0)->GdiTebBatch) );
+@@ -253,6 +256,9 @@ extern int server_get_unix_fd( HANDLE handle, unsigned int wanted_access, int *u
+                                int *needs_close, enum server_fd_type *type, unsigned int *options );
+ extern int wine_server_receive_fd( obj_handle_t *handle );
+ extern void process_exit_wrapper( int status ) DECLSPEC_NORETURN;
++#ifdef __ANDROID__
++extern void wine_android_notify_exit( int status );
++#endif
+ extern size_t server_init_process(void);
+ extern void server_init_process_done(void);
+ extern void server_init_thread( void *entry_point, BOOL *suspend );
+@@ -627,6 +633,8 @@ static inline NTSTATUS map_section( HANDLE mapping, void **ptr, SIZE_T *size, UL
+                                0, NULL, size, ViewShare, 0, protect );
+ }
+ 
++static const ULONG cpsr_user_mask = 0xf620fc30;
++
+ /* LDT definitions */
+ 
+ #if defined(__i386__) || defined(__x86_64__)

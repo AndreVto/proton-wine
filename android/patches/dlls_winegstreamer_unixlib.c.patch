@@ -1,0 +1,21 @@
+diff --git a/dlls/winegstreamer/unixlib.c b/dlls/winegstreamer/unixlib.c
+index b259388026b..5560f256fe1 100644
+--- a/dlls/winegstreamer/unixlib.c
++++ b/dlls/winegstreamer/unixlib.c
+@@ -323,8 +323,15 @@ NTSTATUS wg_init_gstreamer(void *arg)
+     if (!gst_element_register_winegstreamerstepper(NULL))
+         GST_ERROR("Failed to register the stepper element");
+ 
+-    if (!(gl_display = gst_gl_display_new()))
++    if ((e = getenv("WINE_GST_DISABLE_GL")) && !strcmp(e, "1"))
++    {
++        GST_INFO("OpenGL support disabled by WINE_GST_DISABLE_GL.");
++        gl_display = NULL;
++    }
++    else if (!(gl_display = gst_gl_display_new()))
++    {
+         GST_ERROR("Failed to create OpenGL display");
++    }
+ 
+     if (!media_converter_init())
+     {

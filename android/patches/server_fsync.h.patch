@@ -1,0 +1,14 @@
+diff --git a/server/fsync.h b/server/fsync.h
+index c24e23b4895..03bc069b77c 100644
+--- a/server/fsync.h
++++ b/server/fsync.h
+@@ -28,6 +28,9 @@ extern void fsync_set_event( unsigned int shm_idx );
+ extern void fsync_reset_event( unsigned int shm_idx );
+ extern void fsync_abandon_mutex( unsigned int shm_idx, thread_id_t tid );
+ extern void fsync_cleanup_process_shm_indices( process_id_t id );
++#ifdef __ANDROID__
++extern int fsync_drm_export_fd( unsigned int shm_idx );
++#endif
+ 
+ extern int fsync_check_support(void);
+ extern int do_fsync_cached;

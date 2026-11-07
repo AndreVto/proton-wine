@@ -1,0 +1,231 @@
+diff --git a/dlls/winex11.drv/opengl.c b/dlls/winex11.drv/opengl.c
+index 05f6522e5f6..27260fcecfc 100644
+--- a/dlls/winex11.drv/opengl.c
++++ b/dlls/winex11.drv/opengl.c
+@@ -31,6 +31,7 @@
+ 
+ #include <assert.h>
+ #include <stdlib.h>
++#include <stdint.h>
+ #include <string.h>
+ #include <dlfcn.h>
+ #include <sys/socket.h>
+@@ -200,6 +201,7 @@ struct gl_drawable
+ {
+     struct opengl_drawable         base;
+     GLXDrawable                    drawable;     /* drawable for rendering with GL */
++    BOOL                           android_direct;
+ };
+ 
+ static struct gl_drawable *impl_from_opengl_drawable( struct opengl_drawable *base )
+@@ -321,6 +323,15 @@ static INT64 (*pglXSwapBuffersMscOML)( Display *dpy, GLXDrawable drawable,
+ static const GLubyte *(*pglGetString)(GLenum name);
+ 
+ static void *opengl_handle;
++static int (*register_android_glx_window)(void *, unsigned long, uint64_t, uint32_t);
++static int (*register_android_egl_window)(void *, void *, uint64_t, uint32_t);
++
++static BOOL android_gl_direct_present(void)
++{
++    const char *value = getenv( "WINE_ANDROID_DIRECT_PRESENT" );
++    return value && !strcmp( value, "1" );
++}
++
+ static const struct opengl_funcs *funcs;
+ static struct opengl_driver_funcs x11drv_driver_funcs;
+ static const struct opengl_drawable_funcs x11drv_surface_funcs;
+@@ -551,7 +562,21 @@ static BOOL x11drv_egl_surface_create( HWND hwnd, BOOL raw, int format, struct o
+     }
+ 
+     TRACE( "Created drawable %s with client window %lx\n", debugstr_opengl_drawable( &gl->base ), window );
++    /* Flush pending X11 window requests before native surface registration. */
+     XFlush( gdi_display );
++    if (android_gl_direct_present())
++    {
++        Window whole = X11DRV_get_whole_window( NtUserGetAncestor( hwnd, GA_ROOT ) );
++        if (!register_android_egl_window || !whole ||
++            !register_android_egl_window( egl->display, gl->base.surface,
++                                          (uint64_t)(uintptr_t)hwnd, (uint32_t)whole ))
++        {
++            ERR( "Failed to register native EGL surface for hwnd %p, window %lx\n", hwnd, window );
++            opengl_drawable_release( &gl->base );
++            return FALSE;
++        }
++        gl->android_direct = TRUE;
++    }
+ 
+     if (previous) opengl_drawable_release( previous );
+     *drawable = &gl->base;
+@@ -563,6 +588,7 @@ static BOOL x11drv_egl_surface_create( HWND hwnd, BOOL raw, int format, struct o
+  */
+ UINT X11DRV_OpenGLInit( UINT version, const struct opengl_funcs *opengl_funcs, const struct opengl_driver_funcs **driver_funcs )
+ {
++    const char *library;
+     int error_base, event_base;
+ 
+     if (version != WINE_OPENGL_DRIVER_VERSION)
+@@ -575,6 +601,12 @@ UINT X11DRV_OpenGLInit( UINT version, const struct opengl_funcs *opengl_funcs, c
+     if (use_egl && opengl_funcs->egl_handle)
+     {
+         TRACE( "Using EGL OpenGL backend\n" );
++        register_android_egl_window = dlsym( opengl_funcs->egl_handle, "wine_android_register_egl_window" );
++        if (android_gl_direct_present() && !register_android_egl_window)
++        {
++            ERR( "EGL library does not support native window registration\n" );
++            return STATUS_NOT_SUPPORTED;
++        }
+         x11drv_driver_funcs = **driver_funcs;
+         x11drv_driver_funcs.p_init_egl_platform = x11drv_init_egl_platform;
+         x11drv_driver_funcs.p_surface_create = x11drv_egl_surface_create;
+@@ -588,14 +620,19 @@ UINT X11DRV_OpenGLInit( UINT version, const struct opengl_funcs *opengl_funcs, c
+ 
+     /* No need to load any other libraries as according to the ABI, libGL should be self-sufficient
+        and include all dependencies */
+-    opengl_handle = dlopen( SONAME_LIBGL, RTLD_NOW | RTLD_GLOBAL );
++    library = getenv( "WINE_GL_LIBRARY" );
++    if (!library || !*library) library = SONAME_LIBGL;
++    opengl_handle = dlopen( library, RTLD_NOW | RTLD_GLOBAL );
+     if (opengl_handle == NULL)
+     {
+-        ERR( "Failed to load libGL: %s\n", dlerror() );
++        ERR( "Failed to load GL library %s: %s\n", library, dlerror() );
+         ERR( "OpenGL support is disabled.\n");
+         return STATUS_NOT_SUPPORTED;
+     }
+ 
++    /* Resolve the window bridge from the selected GL library. */
++    register_android_glx_window = dlsym( opengl_handle, "wine_android_register_glx_window" );
++
+     /* redirect some standard OpenGL functions */
+ #define LOAD_FUNCPTR(func) \
+         if (!(p##func = dlsym( opengl_handle, #func ))) \
+@@ -670,8 +707,19 @@ UINT X11DRV_OpenGLInit( UINT version, const struct opengl_funcs *opengl_funcs, c
+     {
+         TRACE("GLX is up and running error_base = %d\n", error_base);
+     } else {
+-        ERR( "GLX extension is missing, disabling OpenGL.\n" );
+-        goto failed;
++        Bool (*query_extension)(Display *, int *, int *);
++
++        /* The native GLX bridge can operate without the X server's GLX extension. */
++        query_extension = dlsym( opengl_handle, "glXQueryExtension" );
++        if (!register_android_glx_window || !query_extension ||
++            !query_extension( gdi_display, &error_base, &event_base ))
++        {
++            ERR( "GLX extension is missing, disabling OpenGL.\n" );
++            goto failed;
++        }
++        /* No GLX wire opcode is available for X11 error filtering. */
++        glx_opcode = -1;
++        TRACE( "Using client GLX without server GLX, direct present %u\n", android_gl_direct_present() );
+     }
+ 
+     /* In case of GLX you have direct and indirect rendering. Most of the time direct rendering is used
+@@ -982,6 +1030,25 @@ static BOOL x11drv_surface_create( HWND hwnd, BOOL raw, int format, struct openg
+         return FALSE;
+     }
+ 
++    if (android_gl_direct_present())
++    {
++        Window whole = X11DRV_get_whole_window( NtUserGetAncestor( hwnd, GA_ROOT ) );
++        /* Flush pending X11 window requests before native surface registration. */
++        XFlush( gdi_display );
++        if (!register_android_glx_window || !register_android_glx_window( gdi_display, gl->drawable, (uint64_t)(uintptr_t)hwnd,
++                                   (uint32_t)whole ))
++        {
++            ERR( "Failed to register native GLX surface for hwnd %p, window %lx\n", hwnd, window );
++            opengl_drawable_release( &gl->base );
++            return FALSE;
++        }
++        gl->android_direct = TRUE;
++        gl->base.buffer_map[0] = GL_BACK_LEFT;
++        gl->base.buffer_map[1] = GL_BACK_RIGHT;
++        gl->base.buffer_map[GL_FRONT - GL_FRONT_LEFT] = GL_BACK;
++        gl->base.buffer_map[GL_FRONT_AND_BACK - GL_FRONT_LEFT] = GL_BACK;
++    }
++
+     TRACE( "Created drawable %s with client window %lx\n", debugstr_opengl_drawable( &gl->base ), window );
+     XFlush( gdi_display );
+ 
+@@ -1215,6 +1282,12 @@ static void x11drv_surface_flush( struct opengl_drawable *base, UINT flags )
+ 
+     if (flags & GL_FLUSH_INTERVAL) set_swap_interval( gl, base->interval );
+     if (!(flags & GL_FLUSH_PRESENT)) return;
++    if (gl->android_direct)
++    {
++        client_surface_update( base->client );
++        pglXSwapBuffers( gdi_display, gl->drawable );
++        return;
++    }
+ 
+     if (InterlockedCompareExchange( &base->client->offscreen, 0, 0 ))
+     {
+@@ -1474,6 +1547,12 @@ static BOOL x11drv_surface_swap( struct opengl_drawable *base )
+ 
+     TRACE( "drawable %s\n", debugstr_opengl_drawable( base ) );
+ 
++    if (gl->android_direct)
++    {
++        pglXSwapBuffers( gdi_display, gl->drawable );
++        return TRUE;
++    }
++
+     if (!(offscreen = InterlockedCompareExchange( &base->client->offscreen, 0, 0 )) ||
+         !ctx || !pglXSwapBuffersMscOML) pglXSwapBuffers( gdi_display, gl->drawable );
+     else
+@@ -1501,6 +1580,16 @@ static void x11drv_egl_surface_flush( struct opengl_drawable *base, UINT flags )
+     if (flags & GL_FLUSH_INTERVAL) funcs->p_eglSwapInterval( egl->display, abs( base->interval ) );
+     if (!(flags & GL_FLUSH_PRESENT)) return;
+ 
++    if (impl_from_opengl_drawable( base )->android_direct)
++    {
++        struct gl_drawable *gl = impl_from_opengl_drawable( base );
++        client_surface_update( base->client );
++        if (!funcs->p_eglSwapBuffers( egl->display, gl->base.surface ))
++            ERR( "eglSwapBuffers failed for surface %p, error %#x\n",
++                 gl->base.surface, funcs->p_eglGetError() );
++        return;
++    }
++
+     if (InterlockedCompareExchange( &base->client->offscreen, 0, 0 ))
+     {
+         if (!(flags & GL_FLUSH_FINISHED)) funcs->p_glFinish();
+@@ -1516,6 +1605,38 @@ static BOOL x11drv_egl_surface_swap( struct opengl_drawable *base )
+ 
+     TRACE( "%s\n", debugstr_opengl_drawable( base ) );
+ 
++    if (gl->android_direct)
++    {
++        EGLContext temporary = EGL_NO_CONTEXT;
++        BOOL made_current = FALSE;
++        BOOL swapped = FALSE;
++        EGLenum previous_api = funcs->p_eglQueryAPI();
++
++        /* EGL may need a temporary context for WGL swaps without a current context. */
++        if (!funcs->p_eglGetCurrentContext())
++        {
++            if (funcs->p_eglBindAPI( EGL_OPENGL_API ) &&
++                (temporary = funcs->p_eglCreateContext( egl->display, EGL_NO_CONFIG_KHR,
++                                                        EGL_NO_CONTEXT, NULL )))
++                made_current = funcs->p_eglMakeCurrent( egl->display, gl->base.surface,
++                                                        gl->base.surface, temporary );
++            if (!made_current) goto direct_swap_done;
++        }
++        swapped = funcs->p_eglSwapBuffers( egl->display, gl->base.surface );
++    direct_swap_done:
++        if (!swapped)
++            ERR( "eglSwapBuffers failed for surface %p, error %#x\n",
++                 gl->base.surface, funcs->p_eglGetError() );
++        if (made_current)
++            funcs->p_eglMakeCurrent( egl->display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT );
++        if (temporary) funcs->p_eglDestroyContext( egl->display, temporary );
++        if (previous_api == EGL_NONE)
++            funcs->p_eglReleaseThread();
++        else if (previous_api != EGL_OPENGL_API)
++            funcs->p_eglBindAPI( previous_api );
++        return swapped;
++    }
++
+     if (!funcs->p_eglSwapBuffers( egl->display, gl->base.surface ) && funcs->p_eglGetError() == EGL_BAD_SURFACE
+         && !funcs->p_eglGetCurrentContext())
+     {

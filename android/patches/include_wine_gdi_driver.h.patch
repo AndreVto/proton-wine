@@ -1,0 +1,17 @@
+diff --git a/include/wine/gdi_driver.h b/include/wine/gdi_driver.h
+index 34075ed7cfa..b2e051f1b6e 100644
+--- a/include/wine/gdi_driver.h
++++ b/include/wine/gdi_driver.h
+@@ -266,6 +266,12 @@ struct client_surface
+     HWND                               hwnd;           /* window the surface was created for */
+     LONG                               updated;        /* has been moved / resized / reparented */
+     LONG                               offscreen;      /* client window is offscreen */
++
++    LONG                               geometry_serial; /* invalidates cached swapchain geometry */
++    LONG                               geometry_width;
++    LONG                               geometry_height;
++    UINT                               geometry_dpi;
++    HWND                               geometry_toplevel;
+ };
+ 
+ W32KAPI void *client_surface_create( UINT size, const struct client_surface_funcs *funcs, HWND hwnd );

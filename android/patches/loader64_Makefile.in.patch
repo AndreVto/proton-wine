@@ -1,0 +1,21 @@
+diff --git a/loader64/Makefile.in b/loader64/Makefile.in
+index cfbe51d44d2..b6a7466e588 100644
+--- a/loader64/Makefile.in
++++ b/loader64/Makefile.in
+@@ -1,6 +1,7 @@
+ PARENTSRC = ../loader
+ 
+ SOURCES = \
++	process_relay.c \
+ 	main.c \
+ 	preloader.c \
+ 	preloader_mac.c
+@@ -11,7 +12,7 @@ UNIX_CFLAGS = -fPIE
+ 
+ preloader_EXTRADEFS = -fno-builtin
+ 
+-wine64_OBJS = main.o
++wine64_OBJS = main.o process_relay.o
+ wine64_DEPS = $(WINELOADER_DEPENDS)
+ wine64_LDFLAGS = $(WINELOADER_LDFLAGS) $(LDEXECFLAGS) $(PTHREAD_LIBS)
+ 

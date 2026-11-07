@@ -1,0 +1,185 @@
+diff --git a/dlls/winex11.drv/vulkan.c b/dlls/winex11.drv/vulkan.c
+index 05c9ca4b18c..9fe8c3e5713 100644
+--- a/dlls/winex11.drv/vulkan.c
++++ b/dlls/winex11.drv/vulkan.c
+@@ -28,7 +28,11 @@
+ 
+ #include <stdarg.h>
+ #include <stdio.h>
++#include <stdint.h>
+ #include <dlfcn.h>
++#include <pthread.h>
++#include <stdlib.h>
++#include <string.h>
+ 
+ #include "ntstatus.h"
+ #define WIN32_NO_STATUS
+@@ -45,7 +49,78 @@
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(vulkan);
+ 
++struct ANativeWindow;
++#define ANDROID_VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR ((VkStructureType)1000008000)
++
++struct android_vk_surface_create_info
++{
++    VkStructureType sType;
++    const void *pNext;
++    VkFlags flags;
++    struct ANativeWindow *window;
++};
++
++typedef VkResult (*android_vk_create_surface_khr)( VkInstance instance,
++        const struct android_vk_surface_create_info *create_info,
++        const VkAllocationCallbacks *allocator, VkSurfaceKHR *surface );
++typedef struct ANativeWindow *(*direct_present_acquire_vulkan_func)(uint64_t hwnd, uint32_t x11_window,
++                                                                     uint32_t x11_whole_window, uint64_t owner);
++typedef void (*direct_present_release_func)(struct ANativeWindow *window);
++typedef void (*direct_present_forget_vulkan_func)(uint64_t hwnd, uint64_t owner);
++
+ static const struct vulkan_driver_funcs x11drv_vulkan_driver_funcs;
++static void *android_vulkan_handle;
++static void *android_direct_present_bridge;
++static direct_present_acquire_vulkan_func direct_present_acquire_vulkan;
++static direct_present_release_func direct_present_release;
++static direct_present_forget_vulkan_func direct_present_forget_vulkan;
++static pthread_once_t android_surface_once = PTHREAD_ONCE_INIT;
++
++static BOOL android_direct_present(void)
++{
++    const char *value = getenv( "WINE_ANDROID_DIRECT_PRESENT" );
++    return value && !strcmp( value, "1" );
++}
++
++static void android_load_direct_present_bridge(void)
++{
++    const char *path = getenv( "WINE_ANDROID_DIRECT_PRESENT_LIB" );
++    if (!path || !*path)
++    {
++        ERR( "WINE_ANDROID_DIRECT_PRESENT_LIB is not set\n" );
++        return;
++    }
++    if (!(android_direct_present_bridge = dlopen( path, RTLD_NOW | RTLD_LOCAL )))
++    {
++        ERR( "Failed to load Android direct-present bridge %s: %s\n", debugstr_a(path), dlerror() );
++        return;
++    }
++    direct_present_acquire_vulkan = (direct_present_acquire_vulkan_func)dlsym(
++            android_direct_present_bridge, "android_direct_present_acquire_vulkan" );
++    direct_present_release = (direct_present_release_func)dlsym(
++            android_direct_present_bridge, "android_direct_present_release" );
++    direct_present_forget_vulkan = (direct_present_forget_vulkan_func)dlsym(
++            android_direct_present_bridge, "android_direct_present_forget_vulkan" );
++    if (!direct_present_acquire_vulkan || !direct_present_release || !direct_present_forget_vulkan)
++    {
++        ERR( "Android direct-present bridge is missing required exports\n" );
++        direct_present_acquire_vulkan = NULL;
++        direct_present_release = NULL;
++        direct_present_forget_vulkan = NULL;
++    }
++}
++
++static struct ANativeWindow *android_acquire_surface( uint64_t hwnd, uint32_t x11_window,
++                                                       uint32_t whole_window, uint64_t owner )
++{
++    return direct_present_acquire_vulkan ?
++           direct_present_acquire_vulkan( hwnd, x11_window, whole_window, owner ) : NULL;
++}
++
++static void android_forget_surface( uint64_t hwnd, uint64_t owner )
++{
++    if (direct_present_forget_vulkan) direct_present_forget_vulkan( hwnd, owner );
++}
+ 
+ static VkResult X11DRV_vulkan_surface_create( HWND hwnd, BOOL raw, const struct vulkan_instance *instance,
+                                               VkSurfaceKHR *handle, struct client_surface **client )
+@@ -59,6 +134,65 @@ static VkResult X11DRV_vulkan_surface_create( HWND hwnd, BOOL raw, const struct
+     TRACE( "%p %p %p %p\n", hwnd, instance, handle, client );
+ 
+     if (!(info.window = x11drv_client_surface_create( hwnd, raw, 0, client ))) return VK_ERROR_OUT_OF_HOST_MEMORY;
++
++    if (android_direct_present())
++    {
++        PFN_vkGetInstanceProcAddr get_instance_proc_addr;
++        android_vk_create_surface_khr create_android_surface;
++        struct ANativeWindow *window;
++        Window whole_window;
++        struct android_vk_surface_create_info android_info =
++        {
++            .sType = ANDROID_VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR,
++        };
++        VkResult result;
++        const uint64_t owner = (uint64_t)(uintptr_t)instance->host.instance;
++
++        pthread_once( &android_surface_once, android_load_direct_present_bridge );
++        if (!direct_present_acquire_vulkan || !direct_present_release || !direct_present_forget_vulkan)
++        {
++            client_surface_release( *client );
++            *client = NULL;
++            return VK_ERROR_SURFACE_LOST_KHR;
++        }
++        if (!android_vulkan_handle ||
++            !(get_instance_proc_addr = (PFN_vkGetInstanceProcAddr)dlsym( android_vulkan_handle, "vkGetInstanceProcAddr" )) ||
++            !(create_android_surface = (android_vk_create_surface_khr)get_instance_proc_addr(
++                    instance->host.instance, "vkCreateAndroidSurfaceKHR" )))
++        {
++            ERR( "Host Vulkan does not expose vkCreateAndroidSurfaceKHR\n" );
++            client_surface_release( *client );
++            *client = NULL;
++            return VK_ERROR_EXTENSION_NOT_PRESENT;
++        }
++        whole_window = X11DRV_get_whole_window( NtUserGetAncestor( hwnd, GA_ROOT ) );
++        if (!(window = android_acquire_surface( (uint64_t)(uintptr_t)hwnd,
++                                                      (uint32_t)info.window, (uint32_t)whole_window,
++                                                      owner )))
++        {
++            android_forget_surface( (uint64_t)(uintptr_t)hwnd, owner );
++            client_surface_release( *client );
++            *client = NULL;
++            return VK_ERROR_SURFACE_LOST_KHR;
++        }
++
++        android_info.window = window;
++        result = create_android_surface( instance->host.instance, &android_info, NULL, handle );
++        direct_present_release( window );
++        if (result != VK_SUCCESS)
++        {
++            ERR( "Failed to create Android Vulkan surface for owner=0x%s, result %d\n",
++                 wine_dbgstr_longlong( owner ), result );
++            android_forget_surface( (uint64_t)(uintptr_t)hwnd, owner );
++            client_surface_release( *client );
++            *client = NULL;
++            return result;
++        }
++        TRACE( "Created Android surface 0x%s, client %s\n", wine_dbgstr_longlong( *handle ),
++               debugstr_client_surface( *client ) );
++        return VK_SUCCESS;
++    }
++
+     if (instance->p_vkCreateXlibSurfaceKHR( instance->host.instance, &info, NULL /* allocator */, handle ))
+     {
+         ERR("Failed to create Xlib surface\n");
+@@ -74,12 +208,15 @@ static VkBool32 X11DRV_get_physical_device_presentation_support( struct vulkan_p
+ {
+     struct vulkan_instance *instance = physical_device->instance;
+     TRACE( "%p %u\n", physical_device, index );
++    if (android_direct_present()) return VK_TRUE;
+     return instance->p_vkGetPhysicalDeviceXlibPresentationSupportKHR( physical_device->host.physical_device, index, gdi_display,
+                                                                       default_visual.visual->visualid );
+ }
+ 
+ static void X11DRV_map_instance_extensions( struct vulkan_instance_extensions *extensions )
+ {
++    /* Android surfaces do not use the Xlib surface extension. */
++    if (android_direct_present()) return;
+     if (extensions->has_VK_KHR_win32_surface) extensions->has_VK_KHR_xlib_surface = 1;
+     if (extensions->has_VK_KHR_xlib_surface) extensions->has_VK_KHR_win32_surface = 1;
+ }
+@@ -112,6 +249,7 @@ UINT X11DRV_VulkanInit( UINT version, void *vulkan_handle, const struct vulkan_d
+         return STATUS_INVALID_PARAMETER;
+     }
+ 
++    android_vulkan_handle = vulkan_handle;
+     *driver_funcs = &x11drv_vulkan_driver_funcs;
+     return STATUS_SUCCESS;
+ }

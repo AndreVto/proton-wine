@@ -1,0 +1,2364 @@
+diff --git a/dlls/ntdll/unix/fsync.c b/dlls/ntdll/unix/fsync.c
+index 25d41cac793..91262a7bcf9 100644
+--- a/dlls/ntdll/unix/fsync.c
++++ b/dlls/ntdll/unix/fsync.c
+@@ -44,6 +44,12 @@
+ #endif
+ #include <unistd.h>
+ #include <stdint.h>
++#include <time.h>
++#ifdef __ANDROID__
++#include <dirent.h>
++#include <sys/ioctl.h>
++#include <linux/futex.h>
++#endif
+ 
+ #include "ntstatus.h"
+ #define WIN32_NO_STATUS
+@@ -54,6 +60,9 @@
+ 
+ #include "unix_private.h"
+ #include "fsync.h"
++#ifdef __ANDROID__
++#include "../../../android/shm_utils/shm_utils.h"
++#endif
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(fsync);
+ 
+@@ -63,6 +72,60 @@ WINE_DEFAULT_DEBUG_CHANNEL(fsync);
+ int fsync_enabled;
+ static int current_pid;
+ 
++#ifdef __ANDROID__
++#define FSYNC_SHM_ENTRY_SIZE 32
++#define DRM_CAP_SYNCOBJ 0x13
++#define DRM_CAP_SYNCOBJ_TIMELINE 0x14
++#define DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL (1u << 0)
++#define DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT (1u << 1)
++
++struct drmsync_get_cap { uint64_t capability, value; };
++struct drmsync_destroy { uint32_t handle, pad; };
++struct drmsync_handle { uint32_t handle, flags; int32_t fd; uint32_t pad; };
++_Static_assert( sizeof(struct drmsync_handle) == 16, "legacy DRM syncobj handle layout" );
++struct drmsync_timeline_wait
++{
++    uint64_t handles, points;
++    int64_t timeout_nsec;
++    uint32_t count_handles, flags, first_signaled, pad;
++    uint64_t deadline_nsec;
++};
++struct drmsync_timeline_array { uint64_t handles, points; uint32_t count_handles, flags; };
++
++#define DRMSYNC_IOCTL_GET_CAP _IOWR('d', 0x0c, struct drmsync_get_cap)
++#define DRMSYNC_IOCTL_DESTROY _IOWR('d', 0xc0, struct drmsync_destroy)
++#define DRMSYNC_IOCTL_FD_TO_HANDLE _IOWR('d', 0xc2, struct drmsync_handle)
++#define DRMSYNC_IOCTL_TIMELINE_WAIT _IOWR('d', 0xca, struct drmsync_timeline_wait)
++#define DRMSYNC_IOCTL_QUERY _IOWR('d', 0xcb, struct drmsync_timeline_array)
++#define DRMSYNC_IOCTL_TIMELINE_SIGNAL _IOWR('d', 0xcd, struct drmsync_timeline_array)
++
++#ifndef FUTEX_TID_MASK
++#define FUTEX_TID_MASK 0x3fffffff
++#endif
++#ifndef FUTEX_OWNER_DIED
++#define FUTEX_OWNER_DIED 0x40000000
++#endif
++#ifndef FUTEX_WAITERS
++#define FUTEX_WAITERS 0x80000000
++#endif
++
++#define DRMSYNC_META_ACTIVE 0x00000001u
++
++struct drmsync_meta
++{
++    uint64_t seq;
++    uint32_t pi_futex;
++    uint32_t flags;
++};
++
++_Static_assert( sizeof(struct drmsync_meta) == 16, "drmsync metadata layout" );
++
++static int drmsync_fd = -1;
++static int drmsync_lf_enabled;
++#else
++#define FSYNC_SHM_ENTRY_SIZE 16
++#endif
++
+ /* futex_waitv interface */
+ 
+ #ifndef __NR_futex_waitv
+@@ -121,6 +184,7 @@ static void get_wait_end_time( const LARGE_INTEGER **timeout, struct timespec64
+     end->tv_nsec = (nt_end % TICKSPERSEC) * 100;
+ }
+ 
++#ifndef __ANDROID__
+ static inline void futex_vector_set( struct futex_waitv *waitv, int *addr, int val )
+ {
+     waitv->uaddr = (uintptr_t) addr;
+@@ -128,6 +192,7 @@ static inline void futex_vector_set( struct futex_waitv *waitv, int *addr, int v
+     waitv->flags = FUTEX_32;
+     waitv->__reserved = 0;
+ }
++#endif
+ 
+ static void simulate_sched_quantum(void)
+ {
+@@ -138,6 +203,7 @@ static void simulate_sched_quantum(void)
+     usleep(0);
+ }
+ 
++#ifndef __ANDROID__
+ static inline int futex_wait_multiple( const struct futex_waitv *futexes,
+         int count, const struct timespec64 *end, clockid_t clock_id )
+ {
+@@ -146,15 +212,26 @@ static inline int futex_wait_multiple( const struct futex_waitv *futexes,
+    else
+         return syscall( __NR_futex_waitv, futexes, count, 0, NULL, 0 );
+ }
++#endif
+ 
+ static inline int futex_wake( int *addr, int val )
+ {
+     return syscall( __NR_futex, addr, 1, val, NULL, 0, 0 );
+ }
+ 
++#ifdef __ANDROID__
++struct drmsync_cache;
++#endif
++
+ struct fsync
+ {
+     enum fsync_type type;
++#ifdef __ANDROID__
++    uint32_t drm_handle;
++    struct drmsync_cache *drm_cache;
++    ACCESS_MASK access;
++    unsigned int shm_idx;
++#endif
+     void *shm;              /* pointer to shm section */
+ };
+ 
+@@ -191,13 +268,13 @@ static volatile void *shm_addrs[8192];
+ 
+ static void *get_shm( unsigned int idx )
+ {
+-    int entry  = (idx * 16) / FSYNC_SHM_PAGE_SIZE;
+-    int offset = (idx * 16) % FSYNC_SHM_PAGE_SIZE;
++    int entry  = (idx * FSYNC_SHM_ENTRY_SIZE) / FSYNC_SHM_PAGE_SIZE;
++    int offset = (idx * FSYNC_SHM_ENTRY_SIZE) % FSYNC_SHM_PAGE_SIZE;
+ 
+     if (entry >= ARRAY_SIZE(shm_addrs))
+     {
+         ERR( "idx %u exceeds maximum of %u.\n", idx,
+-             (unsigned int)ARRAY_SIZE(shm_addrs) * (FSYNC_SHM_PAGE_SIZE / 16) );
++             (unsigned int)ARRAY_SIZE(shm_addrs) * (FSYNC_SHM_PAGE_SIZE / FSYNC_SHM_ENTRY_SIZE) );
+         return NULL;
+     }
+ 
+@@ -205,9 +282,12 @@ static void *get_shm( unsigned int idx )
+     {
+         void *addr = mmap( NULL, FSYNC_SHM_PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd,
+                            (off_t)entry * FSYNC_SHM_PAGE_SIZE );
+-        if (addr == (void *)-1)
+-            ERR("Failed to map page %d (offset %s).\n", entry,
+-                 wine_dbgstr_longlong((off_t)entry * FSYNC_SHM_PAGE_SIZE));
++        if (addr == MAP_FAILED)
++        {
++            ERR("Failed to map page %d (offset %s): %s.\n", entry,
++                wine_dbgstr_longlong((off_t)entry * FSYNC_SHM_PAGE_SIZE), strerror(errno));
++            abort();
++        }
+ 
+         TRACE("Mapping page %d at %p.\n", entry, addr);
+ 
+@@ -218,6 +298,439 @@ static void *get_shm( unsigned int idx )
+     return (char *)shm_addrs[entry] + offset;
+ }
+ 
++#ifdef __ANDROID__
++struct drmsync_publish
++{
++    struct drmsync_meta *meta;
++    uint32_t handle;
++    uint32_t tid;
++    uint64_t point;
++    sigset_t old_sigset;
++    int signals_blocked;
++    int signals_preblocked;
++    int locked;
++    int lock_free;
++    int notify;
++};
++
++static struct drmsync_meta *drmsync_meta_from_shm( void *shm )
++{
++    return (struct drmsync_meta *)((char *)shm + 16);
++}
++
++static uint32_t drmsync_native_tid(void)
++{
++    return (uint32_t)gettid() & FUTEX_TID_MASK;
++}
++
++/* Retry control ioctls on interruption; waits return EINTR for a state rescan. */
++static int drmsync_ioctl_retry( int fd, unsigned long request, void *arg )
++{
++    int ret;
++
++    do ret = ioctl( fd, request, arg );
++    while (ret == -1 && (errno == EINTR || errno == EAGAIN));
++    return ret;
++}
++
++/* Do not let a suspend signal park a thread while it holds a shared PI lock. */
++static void drmsync_block_server_signals( struct drmsync_publish *publish )
++{
++    if (publish->signals_blocked) return;
++    pthread_sigmask( SIG_BLOCK, &server_block_set, &publish->old_sigset );
++    publish->signals_blocked = 1;
++}
++
++static void drmsync_restore_server_signals( struct drmsync_publish *publish )
++{
++    if (!publish->signals_blocked) return;
++    pthread_sigmask( SIG_SETMASK, &publish->old_sigset, NULL );
++    publish->signals_blocked = 0;
++}
++
++struct drmsync_signal_scope
++{
++    sigset_t old_sigset;
++    int active;
++};
++
++static void drmsync_signal_scope_enter( struct drmsync_signal_scope *scope )
++{
++    memset( scope, 0, sizeof(*scope) );
++    pthread_sigmask( SIG_BLOCK, &server_block_set, &scope->old_sigset );
++    scope->active = 1;
++}
++
++static void drmsync_signal_scope_leave( struct drmsync_signal_scope *scope )
++{
++    if (!scope->active) return;
++    pthread_sigmask( SIG_SETMASK, &scope->old_sigset, NULL );
++    scope->active = 0;
++}
++
++static int drmsync_caps_ok( int fd )
++{
++    struct drmsync_get_cap cap;
++
++    memset( &cap, 0, sizeof(cap) );
++    cap.capability = DRM_CAP_SYNCOBJ;
++    if (drmsync_ioctl_retry( fd, DRMSYNC_IOCTL_GET_CAP, &cap ) == -1 || !cap.value) return 0;
++    memset( &cap, 0, sizeof(cap) );
++    cap.capability = DRM_CAP_SYNCOBJ_TIMELINE;
++    if (drmsync_ioctl_retry( fd, DRMSYNC_IOCTL_GET_CAP, &cap ) == -1 || !cap.value) return 0;
++    return 1;
++}
++
++static int drmsync_open_device(void)
++{
++    struct dirent *entry;
++    unsigned long best_minor = ULONG_MAX;
++    DIR *dir;
++    int best_fd = -1;
++
++    if (!(dir = opendir( "/dev/dri" ))) return -1;
++
++    while ((entry = readdir( dir )))
++    {
++        const char *suffix;
++        unsigned long minor;
++        char *end;
++        char path[PATH_MAX];
++        int fd, len;
++
++        if (strncmp( entry->d_name, "renderD", 7 )) continue;
++        suffix = entry->d_name + 7;
++        if (!*suffix) continue;
++
++        errno = 0;
++        minor = strtoul( suffix, &end, 10 );
++        if (errno || *end || minor < 128 || minor >= best_minor) continue;
++
++        len = snprintf( path, sizeof(path), "/dev/dri/%s", entry->d_name );
++        if (len < 0 || (size_t)len >= sizeof(path)) continue;
++
++        if ((fd = open( path, O_RDWR | O_CLOEXEC )) == -1) continue;
++        if (!drmsync_caps_ok( fd ))
++        {
++            close( fd );
++            continue;
++        }
++
++        if (best_fd >= 0) close( best_fd );
++        best_fd = fd;
++        best_minor = minor;
++    }
++
++    closedir( dir );
++    return best_fd;
++}
++
++static uint32_t drmsync_import_fd( int fd )
++{
++    struct drmsync_handle args;
++
++    memset( &args, 0, sizeof(args) );
++    args.fd = fd;
++    if (drmsync_ioctl_retry( drmsync_fd, DRMSYNC_IOCTL_FD_TO_HANDLE, &args ) == -1)
++    {
++        ERR( "DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE failed: %s.\n", strerror(errno) );
++        return 0;
++    }
++    return args.handle;
++}
++
++void fsync_destroy_drm_handle( unsigned int handle )
++{
++    struct drmsync_destroy destroy;
++
++    if (!handle || drmsync_fd < 0) return;
++    memset( &destroy, 0, sizeof(destroy) );
++    destroy.handle = handle;
++    if (drmsync_ioctl_retry( drmsync_fd, DRMSYNC_IOCTL_DESTROY, &destroy ) == -1)
++        WARN( "DRM syncobj destroy failed for %u: %s.\n", handle, strerror(errno) );
++}
++
++unsigned int fsync_import_drm_fd( int fd )
++{
++    return drmsync_import_fd( fd );
++}
++
++static int drmsync_pi_lock( uint32_t *word, uint32_t tid, int *owner_died )
++{
++    for (;;)
++    {
++        uint32_t expected = 0;
++        if (__atomic_compare_exchange_n( word, &expected, tid, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED ))
++        {
++            *owner_died = 0;
++            return 0;
++        }
++
++        if (!syscall( __NR_futex, word, FUTEX_LOCK_PI, 0, NULL, NULL, 0 ))
++        {
++            uint32_t state = __atomic_load_n( word, __ATOMIC_ACQUIRE );
++            *owner_died = !!(state & FUTEX_OWNER_DIED);
++            return 0;
++        }
++
++        if (errno == EINTR || errno == EAGAIN) continue;
++
++        if (errno == ESRCH)
++        {
++            /* ESRCH can mean a dead owner left a stale TID without kernel PI state.
++             * Do not clear it: TID reuse makes ownership impossible to verify. */
++            return -1;
++        }
++        return -1;
++    }
++}
++
++static int drmsync_pi_unlock( uint32_t *word, uint32_t tid )
++{
++    uint32_t expected = tid;
++
++    if (__atomic_compare_exchange_n( word, &expected, 0, 0, __ATOMIC_RELEASE, __ATOMIC_RELAXED )) return 0;
++    return syscall( __NR_futex, word, FUTEX_UNLOCK_PI, 0, NULL, NULL, 0 );
++}
++
++static uint64_t drmsync_query_point( uint32_t handle )
++{
++    struct drmsync_timeline_array query;
++    uint64_t point = 0;
++
++    memset( &query, 0, sizeof(query) );
++    query.handles = (uintptr_t)&handle;
++    query.points = (uintptr_t)&point;
++    query.count_handles = 1;
++    if (drmsync_ioctl_retry( drmsync_fd, DRMSYNC_IOCTL_QUERY, &query ) == -1)
++    {
++        ERR( "DRM_IOCTL_SYNCOBJ_QUERY failed: %s.\n", strerror(errno) );
++        abort();
++    }
++    return point;
++}
++
++static void drmsync_signal_points( uint32_t *handles, uint64_t *points, unsigned int count )
++{
++    struct drmsync_timeline_array signal;
++
++    if (!count) return;
++    memset( &signal, 0, sizeof(signal) );
++    signal.handles = (uintptr_t)handles;
++    signal.points = (uintptr_t)points;
++    signal.count_handles = count;
++    if (drmsync_ioctl_retry( drmsync_fd, DRMSYNC_IOCTL_TIMELINE_SIGNAL, &signal ) == -1)
++    {
++        ERR( "DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL failed: %s.\n", strerror(errno) );
++        abort();
++    }
++}
++
++static void drmsync_signal_point( uint32_t handle, uint64_t point )
++{
++    drmsync_signal_points( &handle, &point, 1 );
++}
++
++static void drmsync_recover( struct drmsync_publish *publish )
++{
++    __atomic_store_n( &publish->meta->seq, drmsync_query_point( publish->handle ), __ATOMIC_SEQ_CST );
++}
++
++static void drmsync_publish_lock_tid_ex( struct fsync *obj, struct drmsync_publish *publish, uint32_t tid,
++                                          BOOL signals_preblocked )
++{
++    int owner_died;
++
++    memset( publish, 0, sizeof(*publish) );
++    publish->meta = drmsync_meta_from_shm( obj->shm );
++    publish->handle = obj->drm_handle;
++    publish->tid = tid;
++    publish->signals_preblocked = signals_preblocked;
++    if (!publish->handle)
++    {
++        ERR( "Missing DRM syncobj for fsync object.\n" );
++        abort();
++    }
++
++    if (drmsync_lf_enabled && !(__atomic_load_n( &publish->meta->flags, __ATOMIC_ACQUIRE ) & DRMSYNC_META_ACTIVE))
++    {
++        publish->lock_free = 1;
++        return;
++    }
++
++    if (!signals_preblocked) drmsync_block_server_signals( publish );
++    if (drmsync_pi_lock( &publish->meta->pi_futex, tid, &owner_died ) == -1)
++    {
++        ERR( "FUTEX_LOCK_PI failed: %s.\n", strerror(errno) );
++        abort();
++    }
++    publish->locked = 1;
++    if (owner_died) drmsync_recover( publish );
++}
++
++static void drmsync_publish_lock( struct fsync *obj, struct drmsync_publish *publish )
++{
++    drmsync_publish_lock_tid_ex( obj, publish, drmsync_native_tid(), FALSE );
++}
++
++static void drmsync_publish_lock_force_tid( struct fsync *obj, struct drmsync_publish *publish, uint32_t tid,
++                                             BOOL signals_preblocked )
++{
++    int owner_died;
++
++    memset( publish, 0, sizeof(*publish) );
++    publish->meta = drmsync_meta_from_shm( obj->shm );
++    publish->handle = obj->drm_handle;
++    publish->tid = tid;
++    if (!publish->handle)
++    {
++        ERR( "Missing DRM syncobj for fsync object.\n" );
++        abort();
++    }
++
++    /* WaitAll semaphore transactions require the PI lock even in LF mode. */
++    if (!signals_preblocked) drmsync_block_server_signals( publish );
++    if (drmsync_pi_lock( &publish->meta->pi_futex, tid, &owner_died ) == -1)
++    {
++        ERR( "FUTEX_LOCK_PI failed: %s.\n", strerror(errno) );
++        abort();
++    }
++    publish->locked = 1;
++    if (owner_died) drmsync_recover( publish );
++}
++
++static void drmsync_publish_signal( struct drmsync_publish *publish )
++{
++    uint32_t flags;
++
++    publish->notify = 1;
++    if (publish->lock_free) return;
++    flags = __atomic_load_n( &publish->meta->flags, __ATOMIC_RELAXED );
++    if (!(flags & DRMSYNC_META_ACTIVE)) return;
++    publish->point = __atomic_load_n( &publish->meta->seq, __ATOMIC_SEQ_CST ) + 1;
++    drmsync_signal_point( publish->handle, publish->point );
++}
++
++static void drmsync_publish_unlock( struct drmsync_publish *publish )
++{
++    if (publish->lock_free && publish->notify)
++    {
++        int owner_died;
++
++        __atomic_thread_fence( __ATOMIC_SEQ_CST );
++        /* A waiter may arm DRM notification during the lock-free update. */
++        if (!(__atomic_load_n( &publish->meta->flags, __ATOMIC_ACQUIRE ) & DRMSYNC_META_ACTIVE))
++            goto done;
++        if (!publish->signals_preblocked) drmsync_block_server_signals( publish );
++        if (drmsync_pi_lock( &publish->meta->pi_futex, publish->tid, &owner_died ) == -1)
++        {
++            ERR( "FUTEX_LOCK_PI failed: %s.\n", strerror(errno) );
++            abort();
++        }
++        publish->locked = 1;
++        if (owner_died) drmsync_recover( publish );
++        publish->point = __atomic_load_n( &publish->meta->seq, __ATOMIC_SEQ_CST ) + 1;
++        drmsync_signal_point( publish->handle, publish->point );
++    }
++
++done:
++    if (publish->point)
++        __atomic_store_n( &publish->meta->seq, publish->point, __ATOMIC_SEQ_CST );
++    if (publish->locked && drmsync_pi_unlock( &publish->meta->pi_futex, publish->tid ) == -1)
++    {
++        ERR( "FUTEX_UNLOCK_PI failed: %s.\n", strerror(errno) );
++        abort();
++    }
++    drmsync_restore_server_signals( publish );
++}
++
++static uint64_t drmsync_snapshot_locked_tid( struct fsync *obj, struct drmsync_publish *publish, uint32_t tid,
++                                              BOOL signals_preblocked )
++{
++    uint32_t flags;
++    int owner_died;
++
++    memset( publish, 0, sizeof(*publish) );
++    publish->meta = drmsync_meta_from_shm( obj->shm );
++    publish->handle = obj->drm_handle;
++    publish->tid = tid;
++    if (!publish->handle)
++    {
++        ERR( "Missing DRM syncobj for fsync object.\n" );
++        abort();
++    }
++    if (!signals_preblocked) drmsync_block_server_signals( publish );
++    if (drmsync_pi_lock( &publish->meta->pi_futex, tid, &owner_died ) == -1)
++    {
++        ERR( "FUTEX_LOCK_PI failed: %s.\n", strerror(errno) );
++        abort();
++    }
++    publish->locked = 1;
++    if (owner_died) drmsync_recover( publish );
++    flags = __atomic_load_n( &publish->meta->flags, __ATOMIC_RELAXED );
++    if (!(flags & DRMSYNC_META_ACTIVE))
++        __atomic_store_n( &publish->meta->flags, flags | DRMSYNC_META_ACTIVE, __ATOMIC_RELEASE );
++    return __atomic_load_n( &publish->meta->seq, __ATOMIC_SEQ_CST );
++}
++
++static int64_t drmsync_deadline_ns( const struct timespec64 *end, clockid_t clock_id )
++{
++    struct timespec now_clock, now_mono;
++    int64_t sec, nsec, delta;
++
++    if (!end) return INT64_MAX;
++    if (clock_id == CLOCK_MONOTONIC)
++    {
++        if (end->tv_sec >= INT64_MAX / 1000000000LL) return INT64_MAX;
++        return end->tv_sec * 1000000000LL + end->tv_nsec;
++    }
++
++    clock_gettime( CLOCK_REALTIME, &now_clock );
++    clock_gettime( CLOCK_MONOTONIC, &now_mono );
++    sec = end->tv_sec - now_clock.tv_sec;
++    nsec = end->tv_nsec - now_clock.tv_nsec;
++    if (sec > INT64_MAX / 1000000000LL) return INT64_MAX;
++    if (sec < -INT64_MAX / 1000000000LL)
++        delta = INT64_MIN;
++    else
++        delta = sec * 1000000000LL + nsec;
++    if (delta <= 0) return (int64_t)now_mono.tv_sec * 1000000000LL + now_mono.tv_nsec;
++    if (now_mono.tv_sec >= INT64_MAX / 1000000000LL) return INT64_MAX;
++    if (delta > INT64_MAX - ((int64_t)now_mono.tv_sec * 1000000000LL + now_mono.tv_nsec)) return INT64_MAX;
++    return (int64_t)now_mono.tv_sec * 1000000000LL + now_mono.tv_nsec + delta;
++}
++
++static int drmsync_wait( uint32_t *handles, uint64_t *points, unsigned int count, uint32_t flags,
++                         const struct timespec64 *end, clockid_t clock_id )
++{
++    struct drmsync_timeline_wait wait;
++
++    memset( &wait, 0, sizeof(wait) );
++    wait.handles = (uintptr_t)handles;
++    wait.points = (uintptr_t)points;
++    wait.timeout_nsec = drmsync_deadline_ns( end, clock_id );
++    wait.count_handles = count;
++    wait.flags = DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT | flags;
++    return ioctl( drmsync_fd, DRMSYNC_IOCTL_TIMELINE_WAIT, &wait );
++}
++
++static int futex_wait_single_android( int *addr, int val, const struct timespec64 *end, clockid_t clock_id )
++{
++    struct timespec now, rel;
++    long long sec, nsec;
++
++    if (!end) return syscall( __NR_futex, addr, FUTEX_WAIT, val, NULL, NULL, 0 );
++    clock_gettime( clock_id, &now );
++    sec = end->tv_sec - now.tv_sec;
++    nsec = end->tv_nsec - now.tv_nsec;
++    if (nsec < 0) { --sec; nsec += 1000000000LL; }
++    if (sec < 0 || (!sec && !nsec)) { errno = ETIMEDOUT; return -1; }
++    rel.tv_sec = sec;
++    rel.tv_nsec = nsec;
++    return syscall( __NR_futex, addr, FUTEX_WAIT, val, &rel, NULL, 0 );
++}
++#endif
++
+ /* We'd like lookup to be fast. To that end, we use a static list indexed by handle.
+  * This is copied and adapted from the fd cache code. */
+ 
+@@ -234,6 +747,19 @@ C_ASSERT(sizeof(struct fsync_cache) == sizeof(uint64_t));
+ 
+ static struct fsync_cache *fsync_list[FSYNC_LIST_ENTRIES];
+ static struct fsync_cache fsync_list_initial_block[FSYNC_LIST_BLOCK_SIZE];
++#ifdef __ANDROID__
++struct drmsync_cache
++{
++    LONG refcount;          /* one cache-owner ref plus one per active fsync user */
++    uint32_t handle;
++    unsigned int shm_idx;   /* identifies the Windows object across handle reuse */
++    ACCESS_MASK access;
++    uint32_t closed;
++};
++
++static struct drmsync_cache *drmsync_list[FSYNC_LIST_ENTRIES];
++static struct drmsync_cache drmsync_list_initial_block[FSYNC_LIST_BLOCK_SIZE];
++#endif
+ 
+ static inline UINT_PTR handle_to_index( HANDLE handle, UINT_PTR *entry )
+ {
+@@ -260,7 +786,7 @@ static void add_to_list( HANDLE handle, enum fsync_type type, unsigned int shm_i
+         return;
+     }
+ 
+-    if (!fsync_list[entry])  /* do we need to allocate a new block of entries? */
++    if (!fsync_list[entry])
+     {
+         if (!entry) fsync_list[0] = fsync_list_initial_block;
+         else
+@@ -272,12 +798,114 @@ static void add_to_list( HANDLE handle, enum fsync_type type, unsigned int shm_i
+                 munmap( ptr, FSYNC_LIST_BLOCK_SIZE * sizeof(*fsync_list[entry]) );
+         }
+     }
+-
+     cache.type = type;
+     cache.shm_idx = shm_idx;
+     __atomic_store_n( (UINT64 *)&fsync_list[entry][idx], *(UINT64 *)&cache, __ATOMIC_SEQ_CST );
+ }
+ 
++#ifdef __ANDROID__
++static LONG drmsync_ref_if_nonzero( LONG *refcount )
++{
++    LONG value = __atomic_load_n( refcount, __ATOMIC_ACQUIRE );
++
++    while (value)
++    {
++        if (__atomic_compare_exchange_n( refcount, &value, value + 1, 0,
++                                         __ATOMIC_ACQUIRE, __ATOMIC_RELAXED ))
++            return value;
++    }
++    return 0;
++}
++
++static void drmsync_release_cache( struct drmsync_cache *cache )
++{
++    uint32_t handle = cache->handle;
++    LONG refcount = __atomic_sub_fetch( &cache->refcount, 1, __ATOMIC_ACQ_REL );
++
++    assert( refcount >= 0 );
++    /* The slot may be reused immediately after the final reference is dropped. */
++    if (!refcount) fsync_destroy_drm_handle( handle );
++}
++
++/* Caller holds fd_cache_mutex. On success, the caller owns a reference;
++ * on failure, it retains ownership of drm_handle. */
++static struct drmsync_cache *drmsync_cache_handle( HANDLE handle, enum fsync_type type,
++                                                   unsigned int shm_idx, ACCESS_MASK access,
++                                                   uint32_t drm_handle )
++{
++    UINT_PTR entry, idx = handle_to_index( handle, &entry );
++    struct drmsync_cache *cache;
++    struct fsync_cache fsync_cache;
++
++    if (is_pseudo_handle( handle ) || entry >= FSYNC_LIST_ENTRIES || !fsync_list[entry]) return NULL;
++
++    *(UINT64 *)&fsync_cache = __atomic_load_n( (UINT64 *)&fsync_list[entry][idx], __ATOMIC_SEQ_CST );
++    if (fsync_cache.type != type || fsync_cache.shm_idx != shm_idx) return NULL;
++
++    if (!drmsync_list[entry])
++    {
++        if (!entry) drmsync_list[0] = drmsync_list_initial_block;
++        else
++        {
++            void *ptr = anon_mmap_alloc( FSYNC_LIST_BLOCK_SIZE * sizeof(*drmsync_list[entry]),
++                                         PROT_READ | PROT_WRITE );
++            if (ptr == MAP_FAILED) return NULL;
++            if (__sync_val_compare_and_swap( &drmsync_list[entry], NULL, ptr ))
++                munmap( ptr, FSYNC_LIST_BLOCK_SIZE * sizeof(*drmsync_list[entry]) );
++        }
++    }
++
++    cache = &drmsync_list[entry][idx];
++    if (__atomic_load_n( &cache->refcount, __ATOMIC_ACQUIRE )) return NULL;
++
++    cache->handle = drm_handle;
++    cache->shm_idx = shm_idx;
++    cache->access = access;
++    __atomic_store_n( &cache->closed, 0, __ATOMIC_RELAXED );
++    /* Publish cache fields before the cache-owner and caller references. */
++    __atomic_store_n( &cache->refcount, 2, __ATOMIC_RELEASE );
++    return cache;
++}
++
++static struct drmsync_cache *drmsync_get_cached( HANDLE handle, unsigned int shm_idx )
++{
++    UINT_PTR entry, idx = handle_to_index( handle, &entry );
++    struct drmsync_cache *cache;
++
++    if (entry >= FSYNC_LIST_ENTRIES || !drmsync_list[entry]) return NULL;
++    cache = &drmsync_list[entry][idx];
++    if (!drmsync_ref_if_nonzero( &cache->refcount )) return NULL;
++
++    if (__atomic_load_n( &cache->closed, __ATOMIC_ACQUIRE ) || cache->shm_idx != shm_idx)
++    {
++        drmsync_release_cache( cache );
++        return NULL;
++    }
++    return cache;
++}
++
++/* Caller holds fd_cache_mutex; shm_idx distinguishes reused handle slots. */
++static void drmsync_close_cached( HANDLE handle, unsigned int shm_idx )
++{
++    UINT_PTR entry, idx = handle_to_index( handle, &entry );
++    struct drmsync_cache *cache;
++
++    if (entry >= FSYNC_LIST_ENTRIES || !drmsync_list[entry]) return;
++    cache = &drmsync_list[entry][idx];
++    if (!__atomic_load_n( &cache->refcount, __ATOMIC_ACQUIRE ) || cache->shm_idx != shm_idx) return;
++    if (__atomic_exchange_n( &cache->closed, 1, __ATOMIC_ACQ_REL )) return;
++    drmsync_release_cache( cache );
++}
++
++static void drmsync_put_object( struct fsync *obj )
++{
++    if (obj->drm_cache) drmsync_release_cache( obj->drm_cache );
++    else if (obj->drm_handle) fsync_destroy_drm_handle( obj->drm_handle );
++    obj->drm_cache = NULL;
++    obj->drm_handle = 0;
++}
++#endif
++
+ static void grab_object( struct fsync *obj )
+ {
+     int *shm = obj->shm;
+@@ -285,6 +913,7 @@ static void grab_object( struct fsync *obj )
+     __atomic_add_fetch( &shm[2], 1, __ATOMIC_SEQ_CST );
+ }
+ 
++#ifndef __ANDROID__
+ static unsigned int shm_index_from_shm( char *shm )
+ {
+     unsigned int i, idx_offset;
+@@ -293,8 +922,8 @@ static unsigned int shm_index_from_shm( char *shm )
+     {
+         if (shm >= (char *)shm_addrs[i] && shm < (char *)shm_addrs[i] + FSYNC_SHM_PAGE_SIZE)
+         {
+-            idx_offset = (shm - (char *)shm_addrs[i]) / 16;
+-            return i * (FSYNC_SHM_PAGE_SIZE / 16) + idx_offset;
++            idx_offset = (shm - (char *)shm_addrs[i]) / FSYNC_SHM_ENTRY_SIZE;
++            return i * (FSYNC_SHM_PAGE_SIZE / FSYNC_SHM_ENTRY_SIZE) + idx_offset;
+         }
+     }
+ 
+@@ -302,20 +931,28 @@ static unsigned int shm_index_from_shm( char *shm )
+     return ~0u;
+ }
+ 
++#endif
++
+ static void put_object( struct fsync *obj )
+ {
+     int *shm = obj->shm;
+ 
++#ifdef __ANDROID__
++    drmsync_put_object( obj );
++#endif
+     if (__atomic_load_n( &shm[2], __ATOMIC_SEQ_CST ) == 1)
+     {
+         /* We are holding the last reference, it should be released on server so shm idx get freed. */
+         SERVER_START_REQ( fsync_free_shm_idx )
+         {
++#ifdef __ANDROID__
++            req->shm_idx = obj->shm_idx;
++#else
+             req->shm_idx = shm_index_from_shm( obj->shm );
++#endif
+             wine_server_call( req );
+         }
+         SERVER_END_REQ;
+-        shm_index_from_shm( obj->shm );
+     }
+     else
+     {
+@@ -344,6 +981,12 @@ again:
+     if (!cache.type || !cache.shm_idx) return FALSE;
+ 
+     obj->type = cache.type;
++#ifdef __ANDROID__
++    if (!(obj->drm_cache = drmsync_get_cached( handle, cache.shm_idx ))) return FALSE;
++    obj->drm_handle = obj->drm_cache->handle;
++    obj->access = obj->drm_cache->access;
++    obj->shm_idx = cache.shm_idx;
++#endif
+     obj->shm = get_shm( cache.shm_idx );
+     grab_object( obj );
+     if (((int *)obj->shm)[2] < 2 ||
+@@ -368,6 +1011,13 @@ static NTSTATUS get_object( HANDLE handle, struct fsync *obj )
+     NTSTATUS ret = STATUS_SUCCESS;
+     unsigned int shm_idx = 0;
+     enum fsync_type type = -1;
++#ifdef __ANDROID__
++    ACCESS_MASK access = 0;
++    uint32_t drm_handle = 0;
++    struct drmsync_cache *drm_cache = NULL;
++    obj_handle_t fd_handle = 0;
++    int syncobj_fd = -1;
++#endif
+     sigset_t sigset;
+ 
+     if (get_cached_object( handle, obj )) return STATUS_SUCCESS;
+@@ -390,17 +1040,47 @@ static NTSTATUS get_object( HANDLE handle, struct fsync *obj )
+         req->handle = wine_server_obj_handle( handle );
+         if (!(ret = wine_server_call( req )))
+         {
+-            shm_idx = reply->fsync_shm_idx;
++            shm_idx = reply->sync_shm_idx;
+             type = reply->type;
++#ifdef __ANDROID__
++            access = reply->access;
++            syncobj_fd = wine_server_receive_fd( &fd_handle );
++            assert( wine_server_ptr_handle( fd_handle ) == handle );
++            if (syncobj_fd < 0 || !(drm_handle = drmsync_import_fd( syncobj_fd )))
++                ret = STATUS_NOT_SUPPORTED;
++            if (syncobj_fd >= 0) close( syncobj_fd );
++#endif
+         }
+     }
+     SERVER_END_REQ;
+ 
+-    if (!ret) add_to_list( handle, type, shm_idx );
++#ifdef __ANDROID__
++    if (ret && shm_idx)
++    {
++        SERVER_START_REQ( fsync_free_shm_idx )
++        {
++            req->shm_idx = shm_idx;
++            wine_server_call( req );
++        }
++        SERVER_END_REQ;
++        shm_idx = 0;
++    }
++#endif
++
++    if (!ret)
++    {
++        add_to_list( handle, type, shm_idx );
++#ifdef __ANDROID__
++        drm_cache = drmsync_cache_handle( handle, type, shm_idx, access, drm_handle );
++#endif
++    }
+     server_leave_uninterrupted_section( &fd_cache_mutex, &sigset );
+ 
+     if (ret)
+     {
++#ifdef __ANDROID__
++        if (drm_handle) fsync_destroy_drm_handle( drm_handle );
++#endif
+         WARN("Failed to retrieve shm index for handle %p, status %#x.\n", handle, (unsigned int)ret);
+         return ret;
+     }
+@@ -408,6 +1088,12 @@ static NTSTATUS get_object( HANDLE handle, struct fsync *obj )
+     TRACE("Got shm index %d for handle %p.\n", shm_idx, handle);
+ 
+     obj->type = type;
++#ifdef __ANDROID__
++    obj->drm_handle = drm_handle;
++    obj->drm_cache = drm_cache;
++    obj->access = access;
++    obj->shm_idx = shm_idx;
++#endif
+     obj->shm = get_shm( shm_idx );
+     /* get_fsync_idx server request increments shared mem refcount, so not grabbing object here. */
+     return ret;
+@@ -419,6 +1105,13 @@ static NTSTATUS get_object_for_wait( HANDLE handle, struct fsync *obj, int *prev
+     int *shm;
+ 
+     if ((ret = get_object( handle, obj ))) return ret;
++#ifdef __ANDROID__
++    if ((obj->access & SYNCHRONIZE) != SYNCHRONIZE)
++    {
++        put_object( obj );
++        return STATUS_ACCESS_DENIED;
++    }
++#endif
+ 
+     shm = obj->shm;
+     /* Give wineserver a chance to cleanup shm index if the process
+@@ -444,9 +1137,15 @@ NTSTATUS fsync_close( HANDLE handle )
+         cache.shm_idx = 0;
+         *(UINT64 *)&cache = __atomic_exchange_n( (UINT64 *)&fsync_list[entry][idx],
+                                                    *(UINT64 *)&cache, __ATOMIC_SEQ_CST );
+-        if (cache.type) return STATUS_SUCCESS;
+-    }
+-
++        if (cache.type)
++        {
++#ifdef __ANDROID__
++            drmsync_close_cached( handle, cache.shm_idx );
++#endif
++            return STATUS_SUCCESS;
++        }
++    }
++
+     return STATUS_INVALID_HANDLE;
+ }
+ 
+@@ -454,14 +1153,22 @@ void fsync_init( DWORD pid )
+ {
+     struct stat st;
+ 
+-
+     fsync_enabled = 1;
++#ifdef __ANDROID__
++    drmsync_lf_enabled = getenv( "WINEFSYNC_LF" ) && atoi( getenv( "WINEFSYNC_LF" ) );
++    if ((drmsync_fd = drmsync_open_device()) == -1)
++    {
++        ERR("Server is running with WINEFSYNC but no capable DRM render node is available.\n");
++        exit(1);
++    }
++#else
+     syscall( __NR_futex_waitv, NULL, 0, 0, NULL, 0 );
+     if (errno == ENOSYS || errno == EPERM)
+     {
+         ERR("Server is running with WINEFSYNC but this process can't use __NR_futex_waitv.\n");
+         exit(1);
+     }
++#endif
+ 
+     if (stat( config_dir, &st ) == -1)
+         ERR("Cannot stat %s\n", config_dir);
+@@ -485,33 +1192,134 @@ void fsync_init( DWORD pid )
+     assert( current_pid );
+ }
+ 
+-NTSTATUS fsync_release_semaphore( HANDLE handle, ULONG count, ULONG *prev )
++
++#ifdef __ANDROID__
++static NTSTATUS drmsync_check_access( const struct fsync *obj, ACCESS_MASK access )
++{
++    return (obj->access & access) == access ? STATUS_SUCCESS : STATUS_ACCESS_DENIED;
++}
++
++static NTSTATUS drmsync_release_semaphore_object( struct fsync *obj, ULONG count, ULONG *prev )
+ {
+-    struct fsync obj;
+     struct semaphore *semaphore;
++    struct drmsync_publish publish;
+     ULONG current;
+     NTSTATUS ret;
+ 
+-    if ((ret = get_object( handle, &obj ))) return ret;
+-    semaphore = obj.shm;
++    if (obj->type != FSYNC_SEMAPHORE) return STATUS_OBJECT_TYPE_MISMATCH;
++    if ((ret = drmsync_check_access( obj, SEMAPHORE_MODIFY_STATE ))) return ret;
++    semaphore = obj->shm;
+ 
++    /* WaitAll's tentative semaphore consumption requires PI serialization in LF mode. */
++    drmsync_publish_lock_force_tid( obj, &publish, drmsync_native_tid(), FALSE );
+     do
+     {
+         current = semaphore->count;
+-        if (count + current > semaphore->max)
++        if ((uint64_t)count + current > (uint64_t)semaphore->max)
+         {
+-            put_object( &obj );
++            drmsync_publish_unlock( &publish );
+             return STATUS_SEMAPHORE_LIMIT_EXCEEDED;
+         }
++        if (!current && !publish.point) drmsync_publish_signal( &publish );
+     } while (__sync_val_compare_and_swap( &semaphore->count, current, count + current ) != current);
+ 
+     if (prev) *prev = current;
++    if (!current) futex_wake( &semaphore->count, INT_MAX );
++    drmsync_publish_unlock( &publish );
++    return STATUS_SUCCESS;
++}
+ 
+-    futex_wake( &semaphore->count, INT_MAX );
++static NTSTATUS drmsync_set_event_object( struct fsync *obj, LONG *prev )
++{
++    struct event *event;
++    struct drmsync_publish publish;
++    LONG current;
++    NTSTATUS ret;
++
++    if (obj->type != FSYNC_MANUAL_EVENT && obj->type != FSYNC_AUTO_EVENT)
++        return STATUS_OBJECT_TYPE_MISMATCH;
++    if ((ret = drmsync_check_access( obj, EVENT_MODIFY_STATE ))) return ret;
++    event = obj->shm;
++
++    drmsync_publish_lock( obj, &publish );
++    current = __atomic_load_n( &event->signaled, __ATOMIC_SEQ_CST );
++    if (!current)
++    {
++        drmsync_publish_signal( &publish );
++        __atomic_store_n( &event->signaled, 1, __ATOMIC_SEQ_CST );
++        futex_wake( &event->signaled, INT_MAX );
++    }
++    drmsync_publish_unlock( &publish );
++    if (prev) *prev = current;
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS drmsync_release_mutex_object( struct fsync *obj, LONG *prev )
++{
++    struct mutex *mutex;
++    struct drmsync_publish publish;
++
++    if (obj->type != FSYNC_MUTEX) return STATUS_OBJECT_TYPE_MISMATCH;
++    mutex = obj->shm;
++    if (mutex->tid != GetCurrentThreadId()) return STATUS_MUTANT_NOT_OWNED;
++    if (prev) *prev = mutex->count;
++
++    if (mutex->count == 1)
++    {
++        drmsync_publish_lock( obj, &publish );
++        if (mutex->tid != GetCurrentThreadId())
++        {
++            drmsync_publish_unlock( &publish );
++            return STATUS_MUTANT_NOT_OWNED;
++        }
++        drmsync_publish_signal( &publish );
++        mutex->count = 0;
++        __atomic_store_n( &mutex->tid, 0, __ATOMIC_SEQ_CST );
++        futex_wake( &mutex->tid, INT_MAX );
++        drmsync_publish_unlock( &publish );
++    }
++    else
++        --mutex->count;
+ 
+-    put_object( &obj );
+     return STATUS_SUCCESS;
+ }
++#endif
++
++NTSTATUS fsync_release_semaphore( HANDLE handle, ULONG count, ULONG *prev )
++{
++    struct fsync obj;
++    NTSTATUS ret;
++
++    if ((ret = get_object( handle, &obj ))) return ret;
++#ifdef __ANDROID__
++    ret = drmsync_release_semaphore_object( &obj, count, prev );
++#else
++    if (obj.type != FSYNC_SEMAPHORE)
++        ret = STATUS_OBJECT_TYPE_MISMATCH;
++    else
++    {
++        struct semaphore *semaphore = obj.shm;
++        ULONG current;
++
++        do
++        {
++            current = semaphore->count;
++            if ((uint64_t)count + current > (uint64_t)semaphore->max)
++            {
++                ret = STATUS_SEMAPHORE_LIMIT_EXCEEDED;
++                goto done;
++            }
++        } while (__sync_val_compare_and_swap( &semaphore->count, current, count + current ) != current);
++
++        if (prev) *prev = current;
++        futex_wake( &semaphore->count, INT_MAX );
++        ret = STATUS_SUCCESS;
++    }
++done:
++#endif
++    put_object( &obj );
++    return ret;
++}
+ 
+ NTSTATUS fsync_query_semaphore( HANDLE handle, void *info )
+ {
+@@ -521,6 +1329,18 @@ NTSTATUS fsync_query_semaphore( HANDLE handle, void *info )
+     NTSTATUS ret;
+ 
+     if ((ret = get_object( handle, &obj ))) return ret;
++    if (obj.type != FSYNC_SEMAPHORE)
++    {
++        put_object( &obj );
++        return STATUS_OBJECT_TYPE_MISMATCH;
++    }
++#ifdef __ANDROID__
++    if ((ret = drmsync_check_access( &obj, SEMAPHORE_QUERY_STATE )))
++    {
++        put_object( &obj );
++        return ret;
++    }
++#endif
+     semaphore = obj.shm;
+ 
+     out->CurrentCount = semaphore->count;
+@@ -531,6 +1351,32 @@ NTSTATUS fsync_query_semaphore( HANDLE handle, void *info )
+ }
+ 
+ NTSTATUS fsync_set_event( HANDLE handle, LONG *prev )
++{
++    struct fsync obj;
++    NTSTATUS ret;
++
++    if ((ret = get_object( handle, &obj ))) return ret;
++#ifdef __ANDROID__
++    ret = drmsync_set_event_object( &obj, prev );
++#else
++    if (obj.type != FSYNC_MANUAL_EVENT && obj.type != FSYNC_AUTO_EVENT)
++        ret = STATUS_OBJECT_TYPE_MISMATCH;
++    else
++    {
++        struct event *event = obj.shm;
++        LONG current;
++
++        if (!(current = __atomic_exchange_n( &event->signaled, 1, __ATOMIC_SEQ_CST )))
++            futex_wake( &event->signaled, INT_MAX );
++        if (prev) *prev = current;
++        ret = STATUS_SUCCESS;
++    }
++#endif
++    put_object( &obj );
++    return ret;
++}
++
++NTSTATUS fsync_reset_event( HANDLE handle, LONG *prev )
+ {
+     struct event *event;
+     struct fsync obj;
+@@ -546,8 +1392,22 @@ NTSTATUS fsync_set_event( HANDLE handle, LONG *prev )
+         return STATUS_OBJECT_TYPE_MISMATCH;
+     }
+ 
+-    if (!(current = __atomic_exchange_n( &event->signaled, 1, __ATOMIC_SEQ_CST )))
+-        futex_wake( &event->signaled, INT_MAX );
++#ifdef __ANDROID__
++    if ((ret = drmsync_check_access( &obj, EVENT_MODIFY_STATE )))
++    {
++        put_object( &obj );
++        return ret;
++    }
++#endif
++
++    if (fsync_help_simulated_pulse && event->signaled
++        && __atomic_load_n( &event->last_pid, __ATOMIC_SEQ_CST ) == current_pid)
++    {
++        TRACE( "event %p, helping simulated pulse.\n", handle );
++        usleep( 0 );
++    }
++
++    current = __atomic_exchange_n( &event->signaled, 0, __ATOMIC_SEQ_CST );
+ 
+     if (prev) *prev = current;
+ 
+@@ -555,12 +1415,15 @@ NTSTATUS fsync_set_event( HANDLE handle, LONG *prev )
+     return STATUS_SUCCESS;
+ }
+ 
+-NTSTATUS fsync_reset_event( HANDLE handle, LONG *prev )
++NTSTATUS fsync_pulse_event( HANDLE handle, LONG *prev )
+ {
+     struct event *event;
+     struct fsync obj;
+     LONG current;
+     NTSTATUS ret;
++#ifdef __ANDROID__
++    struct drmsync_publish publish;
++#endif
+ 
+     if ((ret = get_object( handle, &obj ))) return ret;
+     event = obj.shm;
+@@ -571,181 +1434,993 @@ NTSTATUS fsync_reset_event( HANDLE handle, LONG *prev )
+         return STATUS_OBJECT_TYPE_MISMATCH;
+     }
+ 
+-    if (fsync_help_simulated_pulse && event->signaled
+-        && __atomic_load_n( &event->last_pid, __ATOMIC_SEQ_CST ) == current_pid)
+-    {
+-        TRACE( "event %p, helping simulated pulse.\n", handle );
+-        usleep( 0 );
+-    }
++#ifdef __ANDROID__
++    if ((ret = drmsync_check_access( &obj, EVENT_MODIFY_STATE )))
++    {
++        put_object( &obj );
++        return ret;
++    }
++#endif
++
++#ifdef __ANDROID__
++    drmsync_publish_lock( &obj, &publish );
++    current = __atomic_load_n( &event->signaled, __ATOMIC_SEQ_CST );
++    if (!current)
++    {
++        drmsync_publish_signal( &publish );
++        __atomic_store_n( &event->signaled, 1, __ATOMIC_SEQ_CST );
++        futex_wake( &event->signaled, INT_MAX );
++    }
++    drmsync_publish_unlock( &publish );
++#else
++    if (!(current = __atomic_exchange_n( &event->signaled, 1, __ATOMIC_SEQ_CST )))
++        futex_wake( &event->signaled, INT_MAX );
++#endif
++
++    usleep(0);
++    __atomic_store_n( &event->signaled, 0, __ATOMIC_SEQ_CST );
++
++    if (prev) *prev = current;
++    put_object( &obj );
++    return STATUS_SUCCESS;
++}
++
++NTSTATUS fsync_query_event( HANDLE handle, void *info )
++{
++    struct event *event;
++    struct fsync obj;
++    EVENT_BASIC_INFORMATION *out = info;
++    NTSTATUS ret;
++
++    if ((ret = get_object( handle, &obj ))) return ret;
++    if (obj.type != FSYNC_MANUAL_EVENT && obj.type != FSYNC_AUTO_EVENT)
++    {
++        put_object( &obj );
++        return STATUS_OBJECT_TYPE_MISMATCH;
++    }
++#ifdef __ANDROID__
++    if ((ret = drmsync_check_access( &obj, EVENT_QUERY_STATE )))
++    {
++        put_object( &obj );
++        return ret;
++    }
++#endif
++    event = obj.shm;
++
++    out->EventState = event->signaled;
++    out->EventType = (obj.type == FSYNC_AUTO_EVENT ? SynchronizationEvent : NotificationEvent);
++
++    put_object( &obj );
++    return STATUS_SUCCESS;
++}
++
++NTSTATUS fsync_release_mutex( HANDLE handle, LONG *prev )
++{
++    struct fsync obj;
++    NTSTATUS ret;
++
++    if ((ret = get_object( handle, &obj ))) return ret;
++#ifdef __ANDROID__
++    ret = drmsync_release_mutex_object( &obj, prev );
++#else
++    if (obj.type != FSYNC_MUTEX)
++        ret = STATUS_OBJECT_TYPE_MISMATCH;
++    else
++    {
++        struct mutex *mutex = obj.shm;
++
++        if (mutex->tid != GetCurrentThreadId())
++            ret = STATUS_MUTANT_NOT_OWNED;
++        else
++        {
++            if (prev) *prev = mutex->count;
++            if (!--mutex->count)
++            {
++                __atomic_store_n( &mutex->tid, 0, __ATOMIC_SEQ_CST );
++                futex_wake( &mutex->tid, INT_MAX );
++            }
++            ret = STATUS_SUCCESS;
++        }
++    }
++#endif
++    put_object( &obj );
++    return ret;
++}
++
++NTSTATUS fsync_query_mutex( HANDLE handle, void *info )
++{
++    struct fsync obj;
++    struct mutex *mutex;
++    MUTANT_BASIC_INFORMATION *out = info;
++    NTSTATUS ret;
++
++    if ((ret = get_object( handle, &obj ))) return ret;
++    if (obj.type != FSYNC_MUTEX)
++    {
++        put_object( &obj );
++        return STATUS_OBJECT_TYPE_MISMATCH;
++    }
++#ifdef __ANDROID__
++    if ((ret = drmsync_check_access( &obj, MUTANT_QUERY_STATE )))
++    {
++        put_object( &obj );
++        return ret;
++    }
++#endif
++    mutex = obj.shm;
++
++    out->CurrentCount = 1 - mutex->count;
++    out->OwnedByCaller = (mutex->tid == GetCurrentThreadId());
++    out->AbandonedState = (mutex->tid == ~0);
++
++    put_object( &obj );
++    return STATUS_SUCCESS;
++}
++
++static inline void try_yield_to_waiters( int prev_pid )
++{
++    if (!fsync_yield_to_waiters) return;
++
++    /* A woken fsync waiter can lose the object to the signaling thread.
++     * Yield only for a waiter in this process; stale PIDs and concurrent waiters
++     * make last_pid a best-effort hint. */
++
++    if (prev_pid == current_pid)
++        usleep(0);
++}
++
++#ifndef __ANDROID__
++static NTSTATUS do_single_wait( int *addr, int val, const struct timespec64 *end, clockid_t clock_id,
++                                BOOLEAN alertable )
++{
++    struct futex_waitv futexes[2];
++    int ret;
++
++    futex_vector_set( &futexes[0], addr, val );
++
++    if (alertable)
++    {
++        int *apc_futex = ntdll_get_thread_data()->fsync_apc_futex;
++
++        if (__atomic_load_n( apc_futex, __ATOMIC_SEQ_CST ))
++            return STATUS_USER_APC;
++
++        futex_vector_set( &futexes[1], apc_futex, 0 );
++
++        ret = futex_wait_multiple( futexes, 2, end, clock_id );
++
++        if (__atomic_load_n( apc_futex, __ATOMIC_SEQ_CST ))
++            return STATUS_USER_APC;
++    }
++    else
++    {
++        ret = futex_wait_multiple( futexes, 1, end, clock_id );
++    }
++
++    if (!ret)
++        return 0;
++    else if (ret < 0 && errno == ETIMEDOUT)
++        return STATUS_TIMEOUT;
++    else
++        return STATUS_PENDING;
++}
++#endif
++
++static void put_objects( struct fsync *objs, unsigned int count )
++{
++    unsigned int i;
++
++    for (i = 0; i < count; ++i)
++        if (objs[i].type) put_object_from_wait( &objs[i] );
++}
++
++#ifdef __ANDROID__
++static int drmsync_current_tid( int *current_tid )
++{
++    if (!*current_tid) *current_tid = GetCurrentThreadId();
++    return *current_tid;
++}
++
++static void drmsync_yield_if_available( struct fsync *obj, int prev_pid, BOOL waited )
++{
++    if (waited) return;
++    switch (obj->type)
++    {
++    case FSYNC_SEMAPHORE:
++        if (__atomic_load_n( &((struct semaphore *)obj->shm)->count, __ATOMIC_SEQ_CST ))
++            try_yield_to_waiters( prev_pid );
++        break;
++    case FSYNC_MUTEX:
++        if (!__atomic_load_n( &((struct mutex *)obj->shm)->tid, __ATOMIC_SEQ_CST ))
++            try_yield_to_waiters( prev_pid );
++        break;
++    case FSYNC_AUTO_EVENT:
++    case FSYNC_AUTO_SERVER:
++        if (__atomic_load_n( &((struct event *)obj->shm)->signaled, __ATOMIC_SEQ_CST ))
++            try_yield_to_waiters( prev_pid );
++        break;
++    default:
++        break;
++    }
++}
++
++static BOOL drmsync_try_acquire_one( struct fsync *obj, HANDLE handle, unsigned int index,
++                                     BOOL waited, int *current_tid,
++                                     NTSTATUS *status, int **wait_addr, int *wait_val )
++{
++    *status = STATUS_PENDING;
++    *wait_addr = NULL;
++    *wait_val = 0;
++
++    switch (obj->type)
++    {
++    case FSYNC_SEMAPHORE:
++    {
++        struct semaphore *semaphore = obj->shm;
++        int current, new;
++
++        new = __atomic_load_n( &semaphore->count, __ATOMIC_SEQ_CST );
++        while ((current = new))
++        {
++            if ((new = __sync_val_compare_and_swap( &semaphore->count, current, current - 1 )) == current)
++            {
++                TRACE( "Woken up by handle %p [%u].\n", handle, index );
++                *status = index;
++                return TRUE;
++            }
++        }
++        *wait_addr = &semaphore->count;
++        *wait_val = 0;
++        return FALSE;
++    }
++    case FSYNC_MUTEX:
++    {
++        struct mutex *mutex = obj->shm;
++        int tid, self = drmsync_current_tid( current_tid );
++
++        if (__atomic_load_n( &mutex->tid, __ATOMIC_SEQ_CST ) == self)
++        {
++            TRACE( "Woken up by handle %p [%u].\n", handle, index );
++            mutex->count++;
++            *status = index;
++            return TRUE;
++        }
++
++        if (!(tid = __sync_val_compare_and_swap( &mutex->tid, 0, self )))
++        {
++            TRACE( "Woken up by handle %p [%u].\n", handle, index );
++            mutex->count = 1;
++            *status = index;
++            return TRUE;
++        }
++        if (tid == ~0 && (tid = __sync_val_compare_and_swap( &mutex->tid, ~0, self )) == ~0)
++        {
++            TRACE( "Woken up by abandoned mutex %p [%u].\n", handle, index );
++            mutex->count = 1;
++            *status = STATUS_ABANDONED_WAIT_0 + index;
++            return TRUE;
++        }
++
++        if (fsync_yield_to_waiters && waited && !mutex->last_pid)
++            __sync_val_compare_and_swap( &mutex->last_pid, 0, current_pid );
++        *wait_addr = &mutex->tid;
++        *wait_val = tid;
++        return FALSE;
++    }
++    case FSYNC_AUTO_EVENT:
++    case FSYNC_AUTO_SERVER:
++    {
++        struct event *event = obj->shm;
++
++        if (__sync_val_compare_and_swap( &event->signaled, 1, 0 ))
++        {
++            TRACE( "Woken up by handle %p [%u].\n", handle, index );
++            *status = index;
++            return TRUE;
++        }
++        *wait_addr = &event->signaled;
++        *wait_val = 0;
++        return FALSE;
++    }
++    case FSYNC_MANUAL_EVENT:
++    case FSYNC_MANUAL_SERVER:
++    case FSYNC_QUEUE:
++    {
++        struct event *event = obj->shm;
++
++        if (__atomic_load_n( &event->signaled, __ATOMIC_SEQ_CST ))
++        {
++            TRACE( "Woken up by handle %p [%u].\n", handle, index );
++            *status = index;
++            return TRUE;
++        }
++        *wait_addr = &event->signaled;
++        *wait_val = 0;
++        return FALSE;
++    }
++    default:
++        ERR( "Invalid type %#x for handle %p.\n", obj->type, handle );
++        abort();
++    }
++}
++
++static BOOL drmsync_object_available( struct fsync *obj, int *current_tid,
++                                      int **wait_addr, int *wait_val )
++{
++    *wait_addr = NULL;
++    *wait_val = 0;
++
++    if (obj->type == FSYNC_MUTEX)
++    {
++        struct mutex *mutex = obj->shm;
++        int tid = __atomic_load_n( &mutex->tid, __ATOMIC_SEQ_CST );
++        if (!tid || tid == ~0 || tid == drmsync_current_tid( current_tid )) return TRUE;
++        *wait_addr = &mutex->tid;
++        *wait_val = tid;
++        return FALSE;
++    }
++    else
++    {
++        struct event *event = obj->shm;
++        if (__atomic_load_n( &event->signaled, __ATOMIC_SEQ_CST )) return TRUE;
++        *wait_addr = &event->signaled;
++        *wait_val = 0;
++        return FALSE;
++    }
++}
++
++static int drmsync_prepare_apc( struct fsync *apc_obj )
++{
++    struct ntdll_thread_data *data = ntdll_get_thread_data();
++
++    if (!data->fsync_apc_futex)
++    {
++        unsigned int idx = get_inproc_alert_fd();
++
++        TRACE( "get_inproc_alert_fd() %u.\n", idx );
++        if (!idx) return 0;
++        data->fsync_apc_futex = &((struct event *)get_shm( idx ))->signaled;
++    }
++    if (!data->fsync_apc_drm_handle)
++    {
++        ERR( "Missing DRM syncobj for fsync APC alert.\n" );
++        return 0;
++    }
++
++    apc_obj->type = FSYNC_MANUAL_SERVER;
++    apc_obj->drm_handle = data->fsync_apc_drm_handle;
++    apc_obj->drm_cache = NULL;
++    apc_obj->access = SYNCHRONIZE;
++    apc_obj->shm_idx = 0;
++    apc_obj->shm = data->fsync_apc_futex;
++    return 1;
++}
++
++static NTSTATUS drmsync_wait_ioctl_status( uint32_t *handles, uint64_t *points, unsigned int count,
++                                           uint32_t flags, const struct timespec64 *end, clockid_t clock_id )
++{
++    if (!count) return STATUS_PENDING;
++    if (!drmsync_wait( handles, points, count, flags, end, clock_id )) return STATUS_PENDING;
++    if (errno == ETIME || errno == ETIMEDOUT) return STATUS_TIMEOUT;
++    if (errno == EINTR || errno == EAGAIN) return STATUS_PENDING;
++    ERR( "DRM timeline wait failed: %s.\n", strerror(errno) );
++    return STATUS_NOT_SUPPORTED;
++}
++
++static unsigned int drmsync_prepare_waitall_semaphores( struct fsync *objs, unsigned int count,
++                                                          unsigned int *indices, unsigned int *slots )
++{
++    unsigned int i, j, lock_count = 0;
++
++    for (i = 0; i < count; ++i) slots[i] = ~0u;
++
++    /* Lock unique semaphores in shm_idx order to avoid WaitAll deadlocks. */
++    for (i = 0; i < count; ++i)
++    {
++        if (objs[i].type != FSYNC_SEMAPHORE) continue;
++        for (j = 0; j < lock_count; ++j)
++            if (objs[indices[j]].shm_idx == objs[i].shm_idx) break;
++        if (j != lock_count) continue;
++        while (j && objs[indices[j - 1]].shm_idx > objs[i].shm_idx)
++        {
++            indices[j] = indices[j - 1];
++            --j;
++        }
++        indices[j] = i;
++        ++lock_count;
++    }
++
++    for (i = 0; i < count; ++i)
++    {
++        if (objs[i].type != FSYNC_SEMAPHORE) continue;
++        for (j = 0; j < lock_count; ++j)
++            if (objs[indices[j]].shm_idx == objs[i].shm_idx)
++            {
++                slots[i] = j;
++                break;
++            }
++        assert( slots[i] != ~0u );
++    }
++    return lock_count;
++}
++
++static void drmsync_lock_waitall_semaphores( struct fsync *objs,
++                                               struct drmsync_publish *publishes,
++                                               unsigned int *indices, unsigned int lock_count,
++                                               uint32_t native_tid, struct drmsync_signal_scope *signal_scope )
++{
++    unsigned int i;
++
++    if (lock_count) drmsync_signal_scope_enter( signal_scope );
++    for (i = 0; i < lock_count; ++i)
++        drmsync_publish_lock_force_tid( &objs[indices[i]], &publishes[i], native_tid, TRUE );
++}
++
++static void drmsync_unlock_waitall_semaphores( struct drmsync_publish *publishes, unsigned int lock_count,
++                                                struct drmsync_signal_scope *signal_scope )
++{
++    while (lock_count) drmsync_publish_unlock( &publishes[--lock_count] );
++    drmsync_signal_scope_leave( signal_scope );
++}
++
++/* With all semaphore PI locks held, signal rollback points before restoring counts. */
++static void drmsync_signal_waitall_semaphore_rollback( struct fsync *objs, unsigned int acquired_count,
++                                                        struct drmsync_publish *publishes,
++                                                        unsigned int *slots )
++{
++    uint32_t handles[MAXIMUM_WAIT_OBJECTS];
++    uint64_t points[MAXIMUM_WAIT_OBJECTS];
++    unsigned int i, signal_count = 0;
++
++    for (i = 0; i < acquired_count; ++i)
++    {
++        struct drmsync_publish *publish;
++        uint32_t flags;
++
++        if (objs[i].type != FSYNC_SEMAPHORE) continue;
++        assert( slots[i] != ~0u );
++        publish = &publishes[slots[i]];
++        assert( publish->locked );
++        if (publish->notify) continue;
++
++        publish->notify = 1;
++        flags = __atomic_load_n( &publish->meta->flags, __ATOMIC_RELAXED );
++        if (!(flags & DRMSYNC_META_ACTIVE)) continue;
++        publish->point = __atomic_load_n( &publish->meta->seq, __ATOMIC_SEQ_CST ) + 1;
++        handles[signal_count] = publish->handle;
++        points[signal_count++] = publish->point;
++    }
++
++    drmsync_signal_points( handles, points, signal_count );
++}
++
++static void drmsync_restore_waitall_object( struct fsync *obj, int mutex_tid, BOOL mutex_acquired,
++                                               uint32_t native_tid, struct drmsync_publish *semaphore_publish,
++                                               BOOL signals_preblocked )
++{
++    struct drmsync_publish publish;
++
++    switch (obj->type)
++    {
++    case FSYNC_MUTEX:
++        if (!mutex_acquired) break;
++        assert( mutex_tid == 0 || mutex_tid == ~0 );
++        drmsync_publish_lock_tid_ex( obj, &publish, native_tid, signals_preblocked );
++        drmsync_publish_signal( &publish );
++        __atomic_store_n( &((struct mutex *)obj->shm)->tid, mutex_tid, __ATOMIC_SEQ_CST );
++        futex_wake( &((struct mutex *)obj->shm)->tid, INT_MAX );
++        drmsync_publish_unlock( &publish );
++        break;
++    case FSYNC_SEMAPHORE:
++        if (semaphore_publish)
++        {
++            int previous;
++            if (!semaphore_publish->notify) drmsync_publish_signal( semaphore_publish );
++            previous = __sync_fetch_and_add( &((struct semaphore *)obj->shm)->count, 1 );
++            if (!previous) futex_wake( &((struct semaphore *)obj->shm)->count, INT_MAX );
++        }
++        else
++        {
++            int previous;
++            drmsync_publish_lock_tid_ex( obj, &publish, native_tid, signals_preblocked );
++            drmsync_publish_signal( &publish );
++            previous = __sync_fetch_and_add( &((struct semaphore *)obj->shm)->count, 1 );
++            if (!previous) futex_wake( &((struct semaphore *)obj->shm)->count, INT_MAX );
++            drmsync_publish_unlock( &publish );
++        }
++        break;
++    case FSYNC_AUTO_EVENT:
++    case FSYNC_AUTO_SERVER:
++        drmsync_publish_lock_tid_ex( obj, &publish, native_tid, signals_preblocked );
++        drmsync_publish_signal( &publish );
++        __atomic_store_n( &((struct event *)obj->shm)->signaled, 1, __ATOMIC_SEQ_CST );
++        futex_wake( &((struct event *)obj->shm)->signaled, INT_MAX );
++        drmsync_publish_unlock( &publish );
++        break;
++    default:
++        break;
++    }
++}
++
++struct drmsync_wait_context
++{
++    DWORD count;
++    const HANDLE *handles;
++    BOOLEAN alertable;
++    const LARGE_INTEGER *timeout;
++    struct fsync objs[MAXIMUM_WAIT_OBJECTS];
++    struct fsync apc_obj;
++    int prev_pids[MAXIMUM_WAIT_OBJECTS];
++    struct timespec64 end;
++    clockid_t clock_id;
++    int current_tid;
++    uint32_t native_tid;
++};
+ 
+-    current = __atomic_exchange_n( &event->signaled, 0, __ATOMIC_SEQ_CST );
++struct drmsync_waitall_state
++{
++    uint32_t drm_handles[MAXIMUM_WAIT_OBJECTS + 1];
++    uint64_t drm_points[MAXIMUM_WAIT_OBJECTS + 1];
++    unsigned int wait_indices[MAXIMUM_WAIT_OBJECTS];
++    int mutex_tids[MAXIMUM_WAIT_OBJECTS];
++    BOOL mutex_acquired[MAXIMUM_WAIT_OBJECTS];
++    struct drmsync_publish sem_publishes[MAXIMUM_WAIT_OBJECTS];
++    unsigned int sem_indices[MAXIMUM_WAIT_OBJECTS];
++    unsigned int sem_slots[MAXIMUM_WAIT_OBJECTS];
++    struct drmsync_signal_scope prep_signal_scope;
++    struct drmsync_signal_scope sem_signal_scope;
++    unsigned int sem_lock_count;
++    BOOL sem_plan_ready;
++};
+ 
+-    if (prev) *prev = current;
++static NTSTATUS drmsync_finish_user_apc( struct drmsync_wait_context *ctx )
++{
++    static const LARGE_INTEGER zero = {0};
++    NTSTATUS ret;
+ 
+-    put_object( &obj );
+-    return STATUS_SUCCESS;
++    TRACE( "Woken up by user APC.\n" );
++    put_objects( ctx->objs, ctx->count );
++    ret = server_wait( NULL, 0, SELECT_INTERRUPTIBLE | SELECT_ALERTABLE, &zero );
++    if (ret == STATUS_TIMEOUT) ret = STATUS_USER_APC;
++    return ret;
+ }
+ 
+-NTSTATUS fsync_pulse_event( HANDLE handle, LONG *prev )
++static NTSTATUS drmsync_wait_any_android( struct drmsync_wait_context *ctx )
+ {
+-    struct event *event;
+-    struct fsync obj;
+-    LONG current;
+-    NTSTATUS ret;
+-
+-    if ((ret = get_object( handle, &obj ))) return ret;
+-    event = obj.shm;
++    uint32_t drm_handles[MAXIMUM_WAIT_OBJECTS + 1];
++    uint64_t drm_points[MAXIMUM_WAIT_OBJECTS + 1];
++    struct drmsync_signal_scope prep_signal_scope = {0};
++    BOOL waited = FALSE;
++    unsigned int i, waitcount;
++    NTSTATUS ret, status;
+ 
+-    if (obj.type != FSYNC_MANUAL_EVENT && obj.type != FSYNC_AUTO_EVENT)
++    for (;;)
+     {
+-        put_object( &obj );
+-        return STATUS_OBJECT_TYPE_MISMATCH;
+-    }
++        int *wait_addr = NULL, wait_val = 0;
+ 
+-    /* This isn't really correct; an application could miss the write.
+-     * Unfortunately we can't really do much better. Fortunately this is rarely
+-     * used (and publicly deprecated). */
+-    if (!(current = __atomic_exchange_n( &event->signaled, 1, __ATOMIC_SEQ_CST )))
+-        futex_wake( &event->signaled, INT_MAX );
++        if (ctx->alertable && __atomic_load_n( &((struct event *)ctx->apc_obj.shm)->signaled, __ATOMIC_SEQ_CST ))
++            return drmsync_finish_user_apc( ctx );
+ 
+-    /* Try to give other threads a chance to wake up. Hopefully erring on this
+-     * side is the better thing to do... */
+-    usleep(0);
++        if (ctx->count == 1 && !ctx->alertable)
++        {
++            drmsync_yield_if_available( &ctx->objs[0], ctx->prev_pids[0], waited );
++            if (drmsync_try_acquire_one( &ctx->objs[0], ctx->handles[0], 0, waited,
++                                         &ctx->current_tid, &status, &wait_addr, &wait_val ))
++            {
++                if (waited) simulate_sched_quantum();
++                put_objects( ctx->objs, ctx->count );
++                return status;
++            }
+ 
+-    __atomic_store_n( &event->signaled, 0, __ATOMIC_SEQ_CST );
++            if (ctx->timeout && !ctx->timeout->QuadPart)
++            {
++                put_objects( ctx->objs, ctx->count );
++                return STATUS_TIMEOUT;
++            }
++            if (futex_wait_single_android( wait_addr, wait_val, ctx->timeout ? &ctx->end : NULL,
++                                           ctx->clock_id ) == -1 &&
++                (errno == ETIMEDOUT || errno == ETIME))
++            {
++                put_objects( ctx->objs, ctx->count );
++                return STATUS_TIMEOUT;
++            }
++            waited = TRUE;
++            continue;
++        }
+ 
+-    if (prev) *prev = current;
++        for (i = 0; i < ctx->count; ++i)
++        {
++            drmsync_yield_if_available( &ctx->objs[i], ctx->prev_pids[i], waited );
++            if (drmsync_try_acquire_one( &ctx->objs[i], ctx->handles[i], i, waited,
++                                         &ctx->current_tid, &status, &wait_addr, &wait_val ))
++            {
++                if (ac_odyssey && ctx->alertable &&
++                    (ctx->objs[i].type == FSYNC_AUTO_EVENT || ctx->objs[i].type == FSYNC_AUTO_SERVER ||
++                     ctx->objs[i].type == FSYNC_MANUAL_EVENT || ctx->objs[i].type == FSYNC_MANUAL_SERVER ||
++                     ctx->objs[i].type == FSYNC_QUEUE))
++                    usleep( 0 );
++                if (waited && status < STATUS_ABANDONED_WAIT_0) simulate_sched_quantum();
++                put_objects( ctx->objs, ctx->count );
++                return status;
++            }
++        }
+ 
+-    put_object( &obj );
+-    return STATUS_SUCCESS;
+-}
++        /* Polls must not arm persistent DRM notification; an APC still takes priority. */
++        if (ctx->timeout && !ctx->timeout->QuadPart)
++        {
++            if (ctx->alertable && __atomic_load_n( &((struct event *)ctx->apc_obj.shm)->signaled,
++                                                     __ATOMIC_SEQ_CST ))
++                return drmsync_finish_user_apc( ctx );
++            put_objects( ctx->objs, ctx->count );
++            return STATUS_TIMEOUT;
++        }
+ 
+-NTSTATUS fsync_query_event( HANDLE handle, void *info )
+-{
+-    struct event *event;
+-    struct fsync obj;
+-    EVENT_BASIC_INFORMATION *out = info;
+-    NTSTATUS ret;
++        if (!ctx->native_tid) ctx->native_tid = drmsync_native_tid();
++        waitcount = 0;
++        drmsync_signal_scope_enter( &prep_signal_scope );
++        if (ctx->alertable)
++        {
++            struct drmsync_publish publish;
++            uint64_t seq = drmsync_snapshot_locked_tid( &ctx->apc_obj, &publish, ctx->native_tid, TRUE );
++            if (__atomic_load_n( &((struct event *)ctx->apc_obj.shm)->signaled, __ATOMIC_SEQ_CST ))
++            {
++                drmsync_publish_unlock( &publish );
++                drmsync_signal_scope_leave( &prep_signal_scope );
++                return drmsync_finish_user_apc( ctx );
++            }
++            drm_handles[waitcount] = ctx->apc_obj.drm_handle;
++            drm_points[waitcount++] = seq + 1;
++            drmsync_publish_unlock( &publish );
++        }
+ 
+-    if ((ret = get_object( handle, &obj ))) return ret;
+-    event = obj.shm;
++        for (i = 0; i < ctx->count; ++i)
++        {
++            struct drmsync_publish publish;
++            uint64_t seq = drmsync_snapshot_locked_tid( &ctx->objs[i], &publish, ctx->native_tid, TRUE );
+ 
+-    out->EventState = event->signaled;
+-    out->EventType = (obj.type == FSYNC_AUTO_EVENT ? SynchronizationEvent : NotificationEvent);
++            if (drmsync_try_acquire_one( &ctx->objs[i], ctx->handles[i], i, waited,
++                                         &ctx->current_tid, &status, &wait_addr, &wait_val ))
++            {
++                drmsync_publish_unlock( &publish );
++                drmsync_signal_scope_leave( &prep_signal_scope );
++                if (ac_odyssey && ctx->alertable &&
++                    (ctx->objs[i].type == FSYNC_AUTO_EVENT || ctx->objs[i].type == FSYNC_AUTO_SERVER ||
++                     ctx->objs[i].type == FSYNC_MANUAL_EVENT || ctx->objs[i].type == FSYNC_MANUAL_SERVER ||
++                     ctx->objs[i].type == FSYNC_QUEUE))
++                    usleep( 0 );
++                if (waited && status < STATUS_ABANDONED_WAIT_0) simulate_sched_quantum();
++                put_objects( ctx->objs, ctx->count );
++                return status;
++            }
++            drm_handles[waitcount] = ctx->objs[i].drm_handle;
++            drm_points[waitcount++] = seq + 1;
++            drmsync_publish_unlock( &publish );
++        }
+ 
+-    put_object( &obj );
+-    return STATUS_SUCCESS;
++        drmsync_signal_scope_leave( &prep_signal_scope );
++        if (ac_odyssey && ctx->alertable) usleep( 0 );
++
++        ret = drmsync_wait_ioctl_status( drm_handles, drm_points, waitcount, 0,
++                                         ctx->timeout ? &ctx->end : NULL, ctx->clock_id );
++        if (ret == STATUS_TIMEOUT)
++        {
++            put_objects( ctx->objs, ctx->count );
++            return ret;
++        }
++        if (ret != STATUS_PENDING)
++        {
++            put_objects( ctx->objs, ctx->count );
++            return ret;
++        }
++        waited = TRUE;
++    }
+ }
+ 
+-NTSTATUS fsync_release_mutex( HANDLE handle, LONG *prev )
++static BOOL drmsync_waitall_try_commit( struct drmsync_wait_context *ctx,
++                                          struct drmsync_waitall_state *state, NTSTATUS *status )
+ {
+-    struct mutex *mutex;
+-    struct fsync obj;
+-    NTSTATUS ret;
++    BOOL abandoned = FALSE;
++    unsigned int i;
++    int current;
+ 
+-    if ((ret = get_object( handle, &obj ))) return ret;
+-    mutex = obj.shm;
++    if (!state->sem_plan_ready)
++    {
++        state->sem_lock_count = drmsync_prepare_waitall_semaphores( ctx->objs, ctx->count,
++                                                                    state->sem_indices,
++                                                                    state->sem_slots );
++        state->sem_plan_ready = TRUE;
++    }
++    drmsync_lock_waitall_semaphores( ctx->objs, state->sem_publishes, state->sem_indices,
++                                      state->sem_lock_count, ctx->native_tid,
++                                      &state->sem_signal_scope );
+ 
+-    if (mutex->tid != GetCurrentThreadId())
++    /* Availability may change while acquiring the semaphore transaction locks. */
++    for (i = 0; i < ctx->count; ++i)
+     {
+-        put_object( &obj );
+-        return STATUS_MUTANT_NOT_OWNED;
++        struct fsync *obj = &ctx->objs[i];
++        if (obj->type == FSYNC_MUTEX)
++        {
++            int tid = __atomic_load_n( &((struct mutex *)obj->shm)->tid, __ATOMIC_SEQ_CST );
++            if (tid && tid != ~0 && tid != drmsync_current_tid( &ctx->current_tid )) goto retry;
++        }
++        else if (obj->type && !__atomic_load_n( &((struct event *)obj->shm)->signaled, __ATOMIC_SEQ_CST ))
++            goto retry;
+     }
+ 
+-    if (prev) *prev = mutex->count;
++    /* WaitAll is not atomic across object types; roll back partial consumption. */
++    for (i = 0; i < ctx->count; ++i)
++    {
++        struct fsync *obj = &ctx->objs[i];
++        if (!obj->type) continue;
++
++        switch (obj->type)
++        {
++        case FSYNC_MUTEX:
++        {
++            struct mutex *mutex = obj->shm;
++            int tid;
++
++            state->mutex_acquired[i] = FALSE;
++            tid = __atomic_load_n( &mutex->tid, __ATOMIC_SEQ_CST );
++            if (tid == drmsync_current_tid( &ctx->current_tid )) break;
++            if (tid && tid != ~0) goto rollback;
++            if (__sync_val_compare_and_swap( &mutex->tid, tid,
++                                              drmsync_current_tid( &ctx->current_tid ) ) != tid)
++                goto rollback;
++            state->mutex_tids[i] = tid;
++            state->mutex_acquired[i] = TRUE;
++            if (tid == ~0) abandoned = TRUE;
++            break;
++        }
++        case FSYNC_SEMAPHORE:
++        {
++            struct semaphore *semaphore = obj->shm;
++            int new = __atomic_load_n( &semaphore->count, __ATOMIC_SEQ_CST );
++            while ((current = new))
++                if ((new = __sync_val_compare_and_swap( &semaphore->count, current, current - 1 )) == current)
++                    break;
++            if (!current) goto rollback;
++            break;
++        }
++        case FSYNC_AUTO_EVENT:
++        case FSYNC_AUTO_SERVER:
++            if (!__sync_val_compare_and_swap( &((struct event *)obj->shm)->signaled, 1, 0 )) goto rollback;
++            break;
++        default:
++            break;
++        }
++    }
++
++    for (i = 0; i < ctx->count; ++i)
++        if (ctx->objs[i].type == FSYNC_MUTEX) ((struct mutex *)ctx->objs[i].shm)->count++;
++
++    drmsync_unlock_waitall_semaphores( state->sem_publishes, state->sem_lock_count,
++                                       &state->sem_signal_scope );
++    *status = abandoned ? STATUS_ABANDONED : STATUS_SUCCESS;
++    return TRUE;
+ 
+-    if (!--mutex->count)
++rollback:
++    drmsync_signal_waitall_semaphore_rollback( ctx->objs, i, state->sem_publishes, state->sem_slots );
++    while (i--)
+     {
+-        __atomic_store_n( &mutex->tid, 0, __ATOMIC_SEQ_CST );
+-        futex_wake( &mutex->tid, INT_MAX );
++        struct drmsync_publish *semaphore_publish = NULL;
++        if (ctx->objs[i].type == FSYNC_SEMAPHORE)
++        {
++            assert( state->sem_slots[i] != ~0u );
++            semaphore_publish = &state->sem_publishes[state->sem_slots[i]];
++        }
++        drmsync_restore_waitall_object( &ctx->objs[i], state->mutex_tids[i],
++                                        state->mutex_acquired[i], ctx->native_tid, semaphore_publish,
++                                        state->sem_lock_count != 0 );
+     }
+ 
+-    put_object( &obj );
+-    return STATUS_SUCCESS;
++retry:
++    drmsync_unlock_waitall_semaphores( state->sem_publishes, state->sem_lock_count,
++                                       &state->sem_signal_scope );
++    return FALSE;
+ }
+ 
+-NTSTATUS fsync_query_mutex( HANDLE handle, void *info )
++static NTSTATUS drmsync_wait_all_android( struct drmsync_wait_context *ctx )
+ {
+-    struct fsync obj;
+-    struct mutex *mutex;
+-    MUTANT_BASIC_INFORMATION *out = info;
++    struct drmsync_waitall_state state = {0};
++    unsigned int i, j, waitcount, pending_count, object_waitcount;
++    int *single_wait_addr;
++    int single_wait_val;
+     NTSTATUS ret;
+ 
+-    if ((ret = get_object( handle, &obj ))) return ret;
+-    mutex = obj.shm;
++    if (!ctx->native_tid) ctx->native_tid = drmsync_native_tid();
+ 
+-    out->CurrentCount = 1 - mutex->count;
+-    out->OwnedByCaller = (mutex->tid == GetCurrentThreadId());
+-    out->AbandonedState = (mutex->tid == ~0);
++    for (;;)
++    {
++        waitcount = 0;
++        pending_count = object_waitcount = 0;
++        single_wait_addr = NULL;
++        single_wait_val = 0;
+ 
+-    put_object( &obj );
+-    return STATUS_SUCCESS;
+-}
++        if (ctx->alertable && __atomic_load_n( &((struct event *)ctx->apc_obj.shm)->signaled,
++                                                 __ATOMIC_SEQ_CST ))
++            return drmsync_finish_user_apc( ctx );
+ 
+-static inline void try_yield_to_waiters( int prev_pid )
+-{
+-    if (!fsync_yield_to_waiters) return;
++        for (i = 0; i < ctx->count; ++i)
++        {
++            int *wait_addr, wait_val;
+ 
+-    /* On Windows singaling an object will wake the threads waiting on the object. With fsync
+-     * it may happen that signaling thread (or other thread) grabs the object before the already waiting
+-     * thread gets a chance. Try to workaround that for the affected apps. Non-zero 'prev_pid' indicates
+-     * that the object is grabbed in __fsync_wait_objects() by some other thread. It is the same for
+-     * a non-current pid, but we may currently have a stale PID on an object from a terminated process
+-     * and it is probably safer to skip this workaround. This won't work great if the object is used in 'wait all'
+-     * and the waiter is blocked on the other object.
+-     * This check is also not entirely reliable as if multiple waiters from the same process enter
+-     * __fsync_wait_objects() the first one leaving will clear 'last_pid' in the object. */
++            if (!drmsync_object_available( &ctx->objs[i], &ctx->current_tid, &wait_addr, &wait_val ))
++            {
++                if (!pending_count)
++                {
++                    single_wait_addr = wait_addr;
++                    single_wait_val = wait_val;
++                }
++                state.wait_indices[pending_count++] = i;
++            }
++        }
+ 
+-    if (prev_pid == current_pid)
+-        usleep(0);
+-}
++        if (pending_count && ctx->timeout && !ctx->timeout->QuadPart)
++        {
++            if (ctx->alertable && __atomic_load_n( &((struct event *)ctx->apc_obj.shm)->signaled,
++                                                    __ATOMIC_SEQ_CST ))
++                return drmsync_finish_user_apc( ctx );
++            put_objects( ctx->objs, ctx->count );
++            return STATUS_TIMEOUT;
++        }
+ 
+-static NTSTATUS do_single_wait( int *addr, int val, const struct timespec64 *end, clockid_t clock_id,
+-                                BOOLEAN alertable )
+-{
+-    struct futex_waitv futexes[2];
+-    int ret;
++        if (pending_count && (ctx->alertable || pending_count > 1))
++            drmsync_signal_scope_enter( &state.prep_signal_scope );
+ 
+-    futex_vector_set( &futexes[0], addr, val );
++        if (ctx->alertable && pending_count)
++        {
++            struct drmsync_publish publish;
++            uint64_t seq = drmsync_snapshot_locked_tid( &ctx->apc_obj, &publish, ctx->native_tid, TRUE );
++            if (__atomic_load_n( &((struct event *)ctx->apc_obj.shm)->signaled, __ATOMIC_SEQ_CST ))
++            {
++                drmsync_publish_unlock( &publish );
++                drmsync_signal_scope_leave( &state.prep_signal_scope );
++                return drmsync_finish_user_apc( ctx );
++            }
++            state.drm_handles[waitcount] = ctx->apc_obj.drm_handle;
++            state.drm_points[waitcount++] = seq + 1;
++            drmsync_publish_unlock( &publish );
++        }
+ 
+-    if (alertable)
+-    {
+-        int *apc_futex = ntdll_get_thread_data()->fsync_apc_futex;
++        if (!ctx->alertable && pending_count == 1)
++        {
++            if (futex_wait_single_android( single_wait_addr, single_wait_val,
++                                           ctx->timeout ? &ctx->end : NULL, ctx->clock_id ) == -1 &&
++                (errno == ETIMEDOUT || errno == ETIME))
++            {
++                put_objects( ctx->objs, ctx->count );
++                return STATUS_TIMEOUT;
++            }
++            continue;
++        }
+ 
+-        if (__atomic_load_n( apc_futex, __ATOMIC_SEQ_CST ))
+-            return STATUS_USER_APC;
++        /* Recheck under the PI lock to avoid arming already-available objects. */
++        for (j = 0; j < pending_count; ++j)
++        {
++            struct drmsync_publish publish;
++            int *wait_addr, wait_val;
++            uint64_t seq;
+ 
+-        futex_vector_set( &futexes[1], apc_futex, 0 );
++            i = state.wait_indices[j];
++            seq = drmsync_snapshot_locked_tid( &ctx->objs[i], &publish, ctx->native_tid, TRUE );
++            if (!drmsync_object_available( &ctx->objs[i], &ctx->current_tid, &wait_addr, &wait_val ))
++            {
++                if (!object_waitcount)
++                {
++                    single_wait_addr = wait_addr;
++                    single_wait_val = wait_val;
++                }
++                state.drm_handles[waitcount] = ctx->objs[i].drm_handle;
++                state.drm_points[waitcount++] = seq + 1;
++                ++object_waitcount;
++            }
++            drmsync_publish_unlock( &publish );
++        }
+ 
+-        ret = futex_wait_multiple( futexes, 2, end, clock_id );
++        if (pending_count && (ctx->alertable || pending_count > 1))
++            drmsync_signal_scope_leave( &state.prep_signal_scope );
+ 
+-        if (__atomic_load_n( apc_futex, __ATOMIC_SEQ_CST ))
+-            return STATUS_USER_APC;
+-    }
+-    else
+-    {
+-        ret = futex_wait_multiple( futexes, 1, end, clock_id );
+-    }
++        if (object_waitcount)
++        {
++            if (!ctx->alertable && object_waitcount == 1)
++            {
++                if (futex_wait_single_android( single_wait_addr, single_wait_val,
++                                               ctx->timeout ? &ctx->end : NULL, ctx->clock_id ) == -1 &&
++                    (errno == ETIMEDOUT || errno == ETIME))
++                {
++                    put_objects( ctx->objs, ctx->count );
++                    return STATUS_TIMEOUT;
++                }
++                continue;
++            }
+ 
+-    if (!ret)
+-        return 0;
+-    else if (ret < 0 && errno == ETIMEDOUT)
+-        return STATUS_TIMEOUT;
+-    else
+-        return STATUS_PENDING;
++            /* Alertable waits wake on an APC or any member; non-alertable WaitAll
++             * waits for every armed timeline point to advance. */
++            ret = drmsync_wait_ioctl_status( state.drm_handles, state.drm_points, waitcount,
++                                             ctx->alertable ? 0 : DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL,
++                                             ctx->timeout ? &ctx->end : NULL, ctx->clock_id );
++            if (ret == STATUS_TIMEOUT)
++            {
++                put_objects( ctx->objs, ctx->count );
++                return ret;
++            }
++            if (ret != STATUS_PENDING)
++            {
++                put_objects( ctx->objs, ctx->count );
++                return ret;
++            }
++            continue;
++        }
++
++        if (!drmsync_waitall_try_commit( ctx, &state, &ret )) continue;
++
++        put_objects( ctx->objs, ctx->count );
++        return ret;
++    }
+ }
+ 
+-static void put_objects( struct fsync *objs, unsigned int count )
++static NTSTATUS drmsync_wait_objects_android( DWORD count, const HANDLE *handles,
++                                               BOOLEAN wait_any, BOOLEAN alertable,
++                                               const LARGE_INTEGER *timeout )
+ {
++    struct drmsync_wait_context ctx = {0};
++    int has_fsync = 0, has_server = 0;
+     unsigned int i;
++    NTSTATUS ret;
++
++    ctx.count = count;
++    ctx.handles = handles;
++    ctx.alertable = alertable;
++    ctx.timeout = timeout;
++
++    if (alertable && !drmsync_prepare_apc( &ctx.apc_obj )) return STATUS_NOT_SUPPORTED;
++    get_wait_end_time( &ctx.timeout, &ctx.end, &ctx.clock_id );
+ 
+     for (i = 0; i < count; ++i)
+-        if (objs[i].type) put_object_from_wait( &objs[i] );
++    {
++        ret = get_object_for_wait( handles[i], &ctx.objs[i], &ctx.prev_pids[i] );
++        if (ret == STATUS_SUCCESS)
++        {
++            assert( ctx.objs[i].type );
++            has_fsync = 1;
++        }
++        else if (ret == STATUS_NOT_IMPLEMENTED)
++        {
++            memset( &ctx.objs[i], 0, sizeof(ctx.objs[i]) );
++            has_server = 1;
++        }
++        else
++        {
++            put_objects( ctx.objs, i );
++            return ret;
++        }
++    }
++
++    if (has_fsync && has_server)
++    {
++        FIXME( "Can't wait on fsync and server objects at the same time!\n" );
++        put_objects( ctx.objs, count );
++        return STATUS_NOT_IMPLEMENTED;
++    }
++    if (has_server)
++    {
++        put_objects( ctx.objs, count );
++        WARN( "has unimplemented objects.\n" );
++        return STATUS_NOT_IMPLEMENTED;
++    }
++
++    if (wait_any || count <= 1) return drmsync_wait_any_android( &ctx );
++    return drmsync_wait_all_android( &ctx );
+ }
++#endif
+ 
+ NTSTATUS fsync_wait_objects( DWORD count, const HANDLE *handles,
+     BOOLEAN wait_any, BOOLEAN alertable, const LARGE_INTEGER *timeout )
+ {
++#ifdef __ANDROID__
++    return drmsync_wait_objects_android( count, handles, wait_any, alertable, timeout );
++#else
+     static const LARGE_INTEGER zero = {0};
+ 
+     int current_tid = 0;
+@@ -762,7 +2437,6 @@ NTSTATUS fsync_wait_objects( DWORD count, const HANDLE *handles,
+     DWORD waitcount;
+     int i, ret;
+ 
+-    /* Grab the APC futex if we don't already have it. */
+     if (alertable && !ntdll_get_thread_data()->fsync_apc_futex)
+     {
+         unsigned int idx = get_inproc_alert_fd();
+@@ -799,7 +2473,11 @@ NTSTATUS fsync_wait_objects( DWORD count, const HANDLE *handles,
+     }
+ 
+     if (has_fsync && has_server)
++    {
+         FIXME("Can't wait on fsync and server objects at the same time!\n");
++        put_objects( objs, count );
++        return STATUS_NOT_IMPLEMENTED;
++    }
+     else if (has_server)
+     {
+         put_objects( objs, count );
+@@ -1205,6 +2883,7 @@ userapc:
+     if (ret == STATUS_TIMEOUT) ret = STATUS_USER_APC;
+     return ret;
+ #undef CURRENT_TID
++#endif
+ }
+ 
+ NTSTATUS fsync_signal_and_wait( HANDLE signal, HANDLE wait, BOOLEAN alertable,
+@@ -1214,7 +2893,25 @@ NTSTATUS fsync_signal_and_wait( HANDLE signal, HANDLE wait, BOOLEAN alertable,
+     NTSTATUS ret;
+ 
+     if ((ret = get_object( signal, &obj ))) return ret;
+-
++#ifdef __ANDROID__
++    switch (obj.type)
++    {
++    case FSYNC_SEMAPHORE:
++        ret = drmsync_release_semaphore_object( &obj, 1, NULL );
++        break;
++    case FSYNC_AUTO_EVENT:
++    case FSYNC_MANUAL_EVENT:
++        ret = drmsync_set_event_object( &obj, NULL );
++        break;
++    case FSYNC_MUTEX:
++        if (!(ret = drmsync_check_access( &obj, SYNCHRONIZE )))
++            ret = drmsync_release_mutex_object( &obj, NULL );
++        break;
++    default:
++        ret = STATUS_OBJECT_TYPE_MISMATCH;
++        break;
++    }
++#else
+     switch (obj.type)
+     {
+     case FSYNC_SEMAPHORE:
+@@ -1231,6 +2928,7 @@ NTSTATUS fsync_signal_and_wait( HANDLE signal, HANDLE wait, BOOLEAN alertable,
+         ret = STATUS_OBJECT_TYPE_MISMATCH;
+         break;
+     }
++#endif
+     put_object( &obj );
+     if (ret) return ret;
+ 

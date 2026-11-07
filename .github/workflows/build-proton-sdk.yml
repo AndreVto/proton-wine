@@ -1,0 +1,171 @@
+name: Proton Wine ARM64EC
+
+on:
+  push:
+    branches: [proton_11.0-android1]
+  pull_request:
+    branches: [proton_11.0-android1]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
+          df -h
+
+      - name: Checkout Wine source
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Apply Wine patches
+        run: bash build-scripts/build-step-apply-patches.sh
+
+      - name: Install build dependencies
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential git wget curl unzip flex bison gettext autoconf automake \
+            libtool pkg-config mingw-w64 gcc-multilib g++-multilib zstd \
+            libfreetype6-dev libfreetype6-dev:i386 libpng-dev libpng-dev:i386 \
+            zlib1g-dev zlib1g-dev:i386
+
+      - name: Download ARM64 TermuxFS build dependencies
+        run: |
+          mkdir -p "$HOME/termuxfs/aarch64"
+          cd "$HOME/termuxfs/aarch64"
+          wget -q https://github.com/GameNative/termux-on-gha/releases/download/build-20260218/termuxfs-aarch64.tar
+          tar -xf termuxfs-aarch64.tar
+
+      - name: Cache Android NDK
+        id: ndk-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/Android/Sdk/ndk/27.3.13750724
+          key: android-ndk-r27d
+
+      - name: Install Android NDK r27d
+        if: steps.ndk-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$HOME/Android/Sdk/ndk"
+          cd "$HOME/Android/Sdk/ndk"
+          wget -q https://dl.google.com/android/repository/android-ndk-r27d-linux.zip
+          unzip -q android-ndk-r27d-linux.zip
+          mv android-ndk-r27d 27.3.13750724
+
+      - name: Cache LLVM-MinGW
+        id: llvm-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/toolchains/llvm-mingw-20250920-ucrt-ubuntu-22.04-x86_64
+          key: llvm-mingw-20250920
+
+      - name: Install LLVM-MinGW
+        if: steps.llvm-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$HOME/toolchains"
+          cd "$HOME/toolchains"
+          wget -q https://github.com/bylaws/llvm-mingw/releases/download/20250920/llvm-mingw-20250920-ucrt-ubuntu-22.04-x86_64.tar.xz
+          tar -xf llvm-mingw-20250920-ucrt-ubuntu-22.04-x86_64.tar.xz
+
+      - name: Autogenerate Wine configuration
+        run: bash build-scripts/build-step0-autogen.sh
+
+      - name: Cache native Wine tools
+        id: wine-tools-cache
+        uses: actions/cache@v4
+        with:
+          path: wine-tools
+          key: wine-tools-arm64ec-${{ hashFiles('configure.ac', 'configure', 'android/patches/*.patch', 'build-scripts/build-step0.sh') }}
+
+      - name: Build native Wine tools
+        if: steps.wine-tools-cache.outputs.cache-hit != 'true'
+        run: bash build-scripts/build-step0.sh
+
+      - name: Build Android sysvshm if source is available
+        run: bash build-scripts/build-step-arm64ec.sh --build-sysvshm
+
+      - name: Configure ARM64EC Wine
+        run: bash build-scripts/build-step-arm64ec.sh --configure
+
+      - name: Compile ARM64EC Wine
+        run: bash build-scripts/build-step-arm64ec.sh --build
+
+      - name: Install ARM64EC Wine
+        run: bash build-scripts/build-step-arm64ec.sh --install
+
+      - name: Prepare Eclipse component profile
+        run: |
+          cat > profile.json <<'EOF'
+          {
+            "type": "Proton",
+            "versionName": "11.0-1-arm64ec",
+            "versionCode": 1,
+            "description": "Proton 11.0-1 arm64ec - Windows compatibility layer with improved gaming support for Android",
+            "files": [],
+            "wine": {
+              "binPath": "bin",
+              "libPath": "lib"
+            }
+          }
+          EOF
+
+      - name: Package Eclipse ARM64EC WCP
+        run: |
+          cd "$HOME/compiled-files-aarch64"
+          cp "$GITHUB_WORKSPACE/profile.json" .
+          tar -I 'zstd -T0 -19' -cf "$GITHUB_WORKSPACE/proton-11.0-1-arm64ec.wcp" \
+            bin lib share profile.json
+          zstd -t "$GITHUB_WORKSPACE/proton-11.0-1-arm64ec.wcp"
+
+      - name: Upload Eclipse ARM64EC component
+        uses: actions/upload-artifact@v4
+        with:
+          name: proton-arm64ec
+          path: proton-11.0-1-arm64ec.wcp
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    if: github.ref == 'refs/heads/proton_11.0-android1' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    permissions:
+      contents: write
+    steps:
+      - name: Download Eclipse component
+        uses: actions/download-artifact@v4
+        with:
+          name: proton-arm64ec
+          path: release
+
+      - name: Publish Eclipse Proton release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: eclipse-proton-11-${{ github.run_number }}
+          target_commitish: ${{ github.sha }}
+          name: Eclipse Proton 11 ARM64EC - (build ${{ github.run_number }})
+          files: release/proton-11.0-1-arm64ec.wcp
+          prerelease: true
+          body: |
+            # Caution: This version is provided for testing purposes only. It may lead to game instability or crashes. Use at your own risk.
+
+            ## Proton Wine Build based on Valve [Wine](https://github.com/ValveSoftware/wine/tree/proton_11.0)
+
+            ### Proton Version: 11.0-1
+
+            Built from commit: ${{ github.sha }}
+
+            ### Architectures
+            - arm64ec (ARM64EC)
+
+            ### WCP Files
+            **Proton Type:**
+            - `proton-11.0-1-arm64ec.wcp` - For Eclipse (unreleased)

@@ -1,0 +1,38 @@
+diff --git a/dlls/winebus.sys/main.c b/dlls/winebus.sys/main.c
+index 4bc967176ab..31be6205e5c 100644
+--- a/dlls/winebus.sys/main.c
++++ b/dlls/winebus.sys/main.c
+@@ -1327,6 +1327,17 @@ static void bus_options_cleanup(void)
+     list_init(&options.devices);
+ }
+ 
++static NTSTATUS android_driver_init(void)
++{
++    struct bus_main_params bus =
++    {
++        .name = L"ANDROID",
++        .init_code = android_init,
++        .wait_code = android_wait,
++    };
++    return bus_main_thread_start(&bus);
++}
++
+ static NTSTATUS sdl_driver_init(void)
+ {
+     struct bus_main_params bus =
+@@ -1381,6 +1392,7 @@ static NTSTATUS fdo_pnp_dispatch(DEVICE_OBJECT *device, IRP *irp)
+         mouse_device_create();
+         keyboard_device_create();
+ 
++        android_driver_init();
+         udev_driver_init();
+         sdl_driver_init();
+         iohid_driver_init();
+@@ -1391,6 +1403,7 @@ static NTSTATUS fdo_pnp_dispatch(DEVICE_OBJECT *device, IRP *irp)
+         irp->IoStatus.Status = STATUS_SUCCESS;
+         break;
+     case IRP_MN_REMOVE_DEVICE:
++        winebus_call(android_stop, NULL);
+         winebus_call(sdl_stop, NULL);
+         winebus_call(udev_stop, NULL);
+         winebus_call(iohid_stop, NULL);

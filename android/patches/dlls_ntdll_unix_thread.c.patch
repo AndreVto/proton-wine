@@ -1,0 +1,22 @@
+diff --git a/dlls/ntdll/unix/thread.c b/dlls/ntdll/unix/thread.c
+index 9ee9239947f..3228601db8f 100644
+--- a/dlls/ntdll/unix/thread.c
++++ b/dlls/ntdll/unix/thread.c
+@@ -544,7 +544,7 @@ static NTSTATUS context_to_server( struct context_data *to, USHORT to_machine, c
+             to->ctl.arm_regs.sp   = from->Sp;
+             to->ctl.arm_regs.lr   = from->Lr;
+             to->ctl.arm_regs.pc   = from->Pc;
+-            to->ctl.arm_regs.cpsr = from->Cpsr;
++            to->ctl.arm_regs.cpsr = from->Cpsr & cpsr_user_mask;
+         }
+         if (flags & CONTEXT_ARM_INTEGER)
+         {
+@@ -593,7 +593,7 @@ static NTSTATUS context_to_server( struct context_data *to, USHORT to_machine, c
+             to->integer.arm64_regs.x[30] = from->Lr;
+             to->ctl.arm64_regs.sp     = from->Sp;
+             to->ctl.arm64_regs.pc     = from->Pc;
+-            to->ctl.arm64_regs.pstate = from->Cpsr;
++            to->ctl.arm64_regs.pstate = from->Cpsr & cpsr_user_mask;
+         }
+         if (flags & CONTEXT_ARM64_INTEGER)
+         {

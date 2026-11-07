@@ -1,0 +1,12 @@
+diff --git a/loader/process_relay.h b/loader/process_relay.h
+new file mode 100644
+index 00000000000..e8edea40b50
+--- /dev/null
++++ b/loader/process_relay.h
+@@ -0,0 +1,6 @@
++#ifndef __WINE_PROCESS_RELAY_H
++#define __WINE_PROCESS_RELAY_H
++
++int wine_process_relay( int argc, char *argv[] );
++
++#endif

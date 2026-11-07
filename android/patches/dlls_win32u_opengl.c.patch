@@ -1,0 +1,64 @@
+diff --git a/dlls/win32u/opengl.c b/dlls/win32u/opengl.c
+index 03346f5..7082264 100644
+--- a/dlls/win32u/opengl.c
++++ b/dlls/win32u/opengl.c
+@@ -27,6 +27,7 @@
+ #include <pthread.h>
+ #include <dlfcn.h>
+ #include <unistd.h>
++#include <stdlib.h>
+ 
+ #include "ntstatus.h"
+ #define WIN32_NO_STATUS
+@@ -962,12 +963,19 @@ static struct opengl_drawable *framebuffer_surface_create( int format, struct cl
+     return &surface->base;
+ }
+ 
++static BOOL android_direct_present(void)
++{
++    const char *value = getenv( "WINE_ANDROID_DIRECT_PRESENT" );
++    return value && !strcmp( value, "1" );
++}
++
+ static BOOL needs_framebuffer_surface( HWND hwnd )
+ {
+     static int xwayland_nv_cached = -1;
+     float gamma_ramp[GAMMA_RAMP_SIZE * 4];
+     LONG gamma_serial;
+ 
++    if (android_direct_present()) return FALSE;
+     if (!fshack_enabled) return FALSE;
+ 
+     if (xwayland_nv_cached == -1) xwayland_nv_cached = !!user_driver->pHasWindowManager( "xwayland_glx_nvidia" );
+@@ -1433,7 +1441,7 @@ static const struct opengl_driver_funcs egldrv_funcs =
+ static BOOL egl_init( const struct opengl_driver_funcs **driver_funcs )
+ {
+     struct opengl_funcs *funcs = &display_funcs;
+-    const char *extensions, *env;
++    const char *extensions, *env, *library;
+ 
+     if (!(env = getenv( "WINE_USE_EGL" )) || !atoi( env ))
+     {
+@@ -1441,9 +1449,11 @@ static BOOL egl_init( const struct opengl_driver_funcs **driver_funcs )
+         return FALSE;
+     }
+ 
+-    if (!(funcs->egl_handle = dlopen( SONAME_LIBEGL, RTLD_NOW | RTLD_GLOBAL )))
++    library = getenv( "WINE_EGL_LIBRARY" );
++    if (!library || !*library) library = SONAME_LIBEGL;
++    if (!(funcs->egl_handle = dlopen( library, RTLD_NOW | RTLD_GLOBAL )))
+     {
+-        ERR( "Failed to load %s: %s\n", SONAME_LIBEGL, dlerror() );
++        ERR( "Failed to load EGL library %s: %s\n", library, dlerror() );
+         return FALSE;
+     }
+ 
+@@ -2350,7 +2360,7 @@ static BOOL context_sync_drawables( struct wgl_context *context, HDC draw_hdc, H
+                 /* On compat profile the app may use texture names without allocation. Yet it is more common to allocate
+                  * the textures. So use high indexes to make it less likely that an app will want to use those directly
+                  * and allocate those so these names won't be generated for app. */
+-                funcs->p_glGetIntegerv( GL_TEXTURE_2D, &prev_texture );
++                funcs->p_glGetIntegerv( GL_TEXTURE_BINDING_2D, &prev_texture );
+                 for (i = 0; i < ARRAY_SIZE(context->share->framebuffer_textures); ++i)
+                 {
+                     context->share->framebuffer_textures[i] = 0x10000 + i;

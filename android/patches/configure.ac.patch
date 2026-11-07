@@ -1,0 +1,57 @@
+diff --git a/configure.ac b/configure.ac
+index 4f0d5f943e9..a688f68be1c 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -1006,6 +1006,7 @@ case $host_os in
+     LDDLLFLAGS="-fPIC"
+     LDEXECFLAGS="-Wl,-pie"
+     enable_wineandroid_drv=${enable_wineandroid_drv:-yes}
++    enable_wineaaudio_drv=${enable_wineaaudio_drv:-yes}
+     WINE_TRY_CFLAGS([-Wl,-z,defs],[UNIXLDFLAGS="$UNIXLDFLAGS -Wl,-z,defs"])
+     WINE_TRY_CFLAGS([-fPIC -Wl,--export-dynamic],[WINELOADER_LDFLAGS="-Wl,--export-dynamic"])
+     WINEPRELOADER_LDFLAGS="-static -nostartfiles -nodefaultlibs -Wl,-Ttext=0x7d400000"
+@@ -1078,6 +1079,7 @@ case $host_os in
+ esac
+ 
+ enable_winecoreaudio_drv=${enable_winecoreaudio_drv:-no}
++enable_wineaaudio_drv=${enable_wineaaudio_drv:-no}
+ enable_wineandroid_drv=${enable_wineandroid_drv:-no}
+ enable_winemac_drv=${enable_winemac_drv:-no}
+ 
+@@ -1689,6 +1691,19 @@ then
+       [Rebuilding po files is not supported for out of tree builds.])
+ fi
+ 
++dnl **** Check for Android AAudio ****
++AAUDIO_LIBS=""
++case $host_os in
++  linux-android*)
++    AC_CHECK_HEADER([aaudio/AAudio.h],
++        [AC_CHECK_LIB(aaudio, AAudio_createStreamBuilder,
++            [AAUDIO_LIBS="-laaudio"],
++            [enable_wineaaudio_drv=no])],
++        [enable_wineaaudio_drv=no])
++    ;;
++esac
++AC_SUBST(AAUDIO_LIBS)
++
+ dnl **** Check for PulseAudio ****
+ if test "x$with_pulse" != "xno";
+ then
+@@ -1937,7 +1952,7 @@ WINE_NOTICE_WITH(netapi,[test "x$ac_cv_lib_soname_netapi" = "x"],
+ 
+ 
+ dnl **** Check for any sound system ****
+-if test "x$enable_winealsa_drv$enable_winecoreaudio_drv$enable_winepulse_drv$enable_wineoss_drv$enable_wineandroid_drv" = xnonononono -a \
++if test "x$enable_wineaaudio_drv$enable_winealsa_drv$enable_winecoreaudio_drv$enable_winepulse_drv$enable_wineoss_drv$enable_wineandroid_drv" = xnononononono -a \
+         "x$with_alsa$with_coreaudio$with_oss$with_pulse" != xnononono
+ then
+     WINE_WARNING([No sound system was found. Windows applications will be silent.])
+@@ -3426,6 +3441,7 @@ WINE_CONFIG_MAKEFILE(dlls/windowscodecs/tests)
+ WINE_CONFIG_MAKEFILE(dlls/windowscodecsext)
+ WINE_CONFIG_MAKEFILE(dlls/windowscodecsext/tests)
+ WINE_CONFIG_MAKEFILE(dlls/winealsa.drv)
++WINE_CONFIG_MAKEFILE(dlls/wineaaudio.drv)
+ WINE_CONFIG_MAKEFILE(dlls/wineandroid.drv)
+ WINE_CONFIG_MAKEFILE(dlls/winebth.sys)
+ WINE_CONFIG_MAKEFILE(dlls/winebus.sys)

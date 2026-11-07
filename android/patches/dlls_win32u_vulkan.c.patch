@@ -1,0 +1,460 @@
+diff --git a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
+index e85c9d2a0aa..a8e84167411 100644
+--- a/dlls/win32u/vulkan.c
++++ b/dlls/win32u/vulkan.c
+@@ -27,6 +27,8 @@
+ #include <math.h>
+ #include <dlfcn.h>
+ #include <pthread.h>
++#include <stdlib.h>
++#include <string.h>
+ #include <unistd.h>
+ 
+ #include "ntstatus.h"
+@@ -48,6 +50,55 @@ WINE_DECLARE_DEBUG_CHANNEL(fps);
+ 
+ static const struct vulkan_driver_funcs *driver_funcs;
+ static int fshack_enabled = -1;
++static BOOL android_host_surface;
++
++static BOOL android_direct_present(void)
++{
++    const char *value = getenv( "WINE_ANDROID_DIRECT_PRESENT" );
++    return value && !strcmp( value, "1" );
++}
++
++static BOOL android_surface_control(void)
++{
++    const char *value = getenv( "WINE_ANDROID_SURFACE_CONTROL" );
++    return value && !strcmp( value, "1" );
++}
++
++typedef void (*direct_present_forget_vulkan_func)(uint64_t hwnd, uint64_t owner);
++typedef uint64_t (*direct_present_surface_generation_func)(uint64_t hwnd, uint64_t owner);
++static pthread_once_t android_surface_forget_once = PTHREAD_ONCE_INIT;
++static void *android_direct_present_bridge;
++static direct_present_forget_vulkan_func direct_present_forget_vulkan;
++static direct_present_surface_generation_func direct_present_surface_generation;
++
++static void android_load_surface_forget(void)
++{
++    const char *path = getenv( "WINE_ANDROID_DIRECT_PRESENT_LIB" );
++    if (!path || !*path) return;
++    if (!(android_direct_present_bridge = dlopen( path, RTLD_NOW | RTLD_LOCAL ))) return;
++    direct_present_forget_vulkan = (direct_present_forget_vulkan_func)dlsym(
++            android_direct_present_bridge, "android_direct_present_forget_vulkan" );
++    direct_present_surface_generation = (direct_present_surface_generation_func)dlsym(
++            android_direct_present_bridge, "android_direct_present_surface_generation" );
++}
++
++static void android_forget_surface(HWND hwnd, VkInstance host_instance)
++{
++    const uint64_t owner = (uint64_t)(uintptr_t)host_instance;
++    if (!android_direct_present()) return;
++    pthread_once( &android_surface_forget_once, android_load_surface_forget );
++    if (direct_present_forget_vulkan)
++        direct_present_forget_vulkan( (uint64_t)(uintptr_t)hwnd, owner );
++}
++
++static uint64_t android_surface_generation(HWND hwnd, VkInstance host_instance)
++{
++    const uint64_t owner = (uint64_t)(uintptr_t)host_instance;
++    if (!android_direct_present()) return 0;
++    pthread_once( &android_surface_forget_once, android_load_surface_forget );
++    if (!direct_present_surface_generation) return 0;
++    return direct_present_surface_generation( (uint64_t)(uintptr_t)hwnd, owner );
++}
+ 
+ static const UINT EXTERNAL_MEMORY_WIN32_BITS = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT |
+                                                VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT |
+@@ -145,6 +196,8 @@ struct surface
+     struct vulkan_surface obj;
+     struct client_surface *client;
+     HWND hwnd;
++    BOOL surface_control;
++    uint64_t direct_present_generation;
+ };
+ 
+ static struct surface *surface_from_handle( VkSurfaceKHR handle )
+@@ -153,6 +206,15 @@ static struct surface *surface_from_handle( VkSurfaceKHR handle )
+     return CONTAINING_RECORD( obj, struct surface, obj );
+ }
+ 
++static BOOL android_surface_generation_changed( const struct surface *surface )
++{
++    uint64_t current;
++
++    if (!surface->surface_control || !surface->direct_present_generation) return FALSE;
++    current = android_surface_generation( surface->hwnd, surface->obj.instance->host.instance );
++    return current != surface->direct_present_generation;
++}
++
+ /* Return whether integer scaling is on */
+ static BOOL fs_hack_is_integer(void)
+ {
+@@ -188,6 +250,8 @@ struct swapchain
+     struct vulkan_swapchain obj;
+     struct surface *surface;
+     VkExtent2D extents;
++    VkSurfaceTransformFlagBitsKHR pre_transform;
++    LONG geometry_serial;
+ 
+     /* fs hack data below */
+     UINT fshack_dpi;
+@@ -209,6 +273,33 @@ static struct swapchain *swapchain_from_handle( VkSwapchainKHR handle )
+     return CONTAINING_RECORD( obj, struct swapchain, obj );
+ }
+ 
++static BOOL extents_equals( const VkExtent2D *extents, const RECT *rect );
++
++static LONG surface_geometry_serial( const struct surface *surface )
++{
++    if (!surface || !surface->client) return 0;
++    return InterlockedCompareExchange( &surface->client->geometry_serial, 0, 0 );
++}
++
++static BOOL swapchain_geometry_changed( const struct swapchain *swapchain )
++{
++    return swapchain->geometry_serial != surface_geometry_serial( swapchain->surface );
++}
++
++static BOOL swapchain_extent_matches_client( const struct swapchain *swapchain, const RECT *client_rect )
++{
++    if (extents_equals( &swapchain->extents, client_rect ))
++        return TRUE;
++
++    if ((swapchain->pre_transform == VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR ||
++         swapchain->pre_transform == VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR) &&
++        swapchain->extents.width == (UINT)(client_rect->bottom - client_rect->top) &&
++        swapchain->extents.height == (UINT)(client_rect->right - client_rect->left))
++        return TRUE;
++
++    return FALSE;
++}
++
+ struct semaphore
+ {
+     struct vulkan_semaphore obj;
+@@ -463,6 +554,7 @@ static VkResult convert_instance_create_info( struct mempool *pool, VkInstanceCr
+     const VkBaseInStructure *header = (const VkBaseInStructure *)info;
+     const VkDebugReportCallbackCreateInfoEXT *debug_report_callback;
+     const char **extensions;
++    BOOL android_surface;
+     uint32_t count = 0;
+ 
+     while ((header = find_next_struct( header->pNext, VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT )))
+@@ -490,6 +582,8 @@ static VkResult convert_instance_create_info( struct mempool *pool, VkInstanceCr
+         return VK_ERROR_LAYER_NOT_PRESENT;
+     }
+ 
++    android_surface = android_direct_present() &&
++                           instance->obj.extensions.has_VK_KHR_win32_surface;
+     driver_funcs->p_map_instance_extensions( &instance->obj.extensions );
+     instance->obj.extensions.has_VK_KHR_win32_surface = 0;
+ 
+@@ -510,10 +604,19 @@ static VkResult convert_instance_create_info( struct mempool *pool, VkInstanceCr
+      * external semaphore fds to implement it, so we enable the instance extensions too */
+     instance->obj.extensions.has_VK_KHR_external_semaphore_capabilities = 1;
+ 
+-    if (!(extensions = mem_alloc( pool, sizeof(instance->obj.extensions) * 8 * sizeof(*extensions) ))) return VK_ERROR_OUT_OF_HOST_MEMORY;
++    if (!(extensions = mem_alloc( pool, (sizeof(instance->obj.extensions) * 8 + 1) * sizeof(*extensions) ))) return VK_ERROR_OUT_OF_HOST_MEMORY;
+ #define USE_VK_EXT(x) if (instance->obj.extensions.has_ ## x) extensions[count++] = #x;
+     ALL_VK_INSTANCE_EXTS
+ #undef USE_VK_EXT
++    if (android_surface)
++    {
++        if (!android_host_surface)
++        {
++            ERR( "Android direct present requested but host Vulkan does not expose VK_KHR_android_surface\n" );
++            return VK_ERROR_EXTENSION_NOT_PRESENT;
++        }
++        extensions[count++] = "VK_KHR_android_surface";
++    }
+ 
+     TRACE( "Enabling %u host instance extensions\n", count );
+     for (const char **extension = extensions, **end = extension + count; extension < end; extension++)
+@@ -1720,6 +1823,7 @@ static VkResult win32u_vkCreateWin32SurfaceKHR( VkInstance client_instance, cons
+         surface->hwnd = dummy;
+     }
+ 
++    surface->surface_control = android_surface_control();
+     if ((res = driver_funcs->p_vulkan_surface_create( surface->hwnd, fshack_enabled, instance,
+                                                       &host_surface, &surface->client )))
+     {
+@@ -1732,6 +1836,10 @@ static VkResult win32u_vkCreateWin32SurfaceKHR( VkInstance client_instance, cons
+ 
+     vulkan_object_init( &surface->obj.obj, host_surface );
+     surface->obj.instance = instance;
++    if (surface->surface_control)
++    {
++        surface->direct_present_generation = android_surface_generation( surface->hwnd, instance->host.instance );
++    }
+     instance->p_insert_object( instance, &surface->obj.obj );
+ 
+     if (dummy) NtUserDestroyWindow( dummy );
+@@ -1752,6 +1860,7 @@ static void win32u_vkDestroySurfaceKHR( VkInstance client_instance, VkSurfaceKHR
+     if (allocator) FIXME( "Support for allocation callbacks not implemented yet\n" );
+ 
+     instance->p_vkDestroySurfaceKHR( instance->host.instance, surface->obj.host.surface, NULL /* allocator */ );
++    android_forget_surface( surface->hwnd, instance->host.instance );
+     client_surface_release( surface->client );
+ 
+     instance->p_remove_object( instance, &surface->obj.obj );
+@@ -1769,6 +1878,10 @@ static BOOL get_surface_rect( HWND hwnd, RECT *rect, UINT dpi )
+ static void adjust_surface_capabilities( struct vulkan_instance *instance, struct surface *surface,
+                                          VkSurfaceCapabilitiesKHR *capabilities )
+ {
++    VkExtent2D host_min_extent = capabilities->minImageExtent;
++    VkExtent2D host_max_extent = capabilities->maxImageExtent;
++    VkSurfaceTransformFlagBitsKHR host_transform = capabilities->currentTransform;
++    BOOL preserve_host_extent_range;
+     RECT client_rect;
+ 
+     /* Many Windows games, for example Strange Brigade, No Man's Sky, Path of Exile
+@@ -1783,12 +1896,24 @@ static void adjust_surface_capabilities( struct vulkan_instance *instance, struc
+     /* Update the image extents to match what the Win32 WSI would provide. */
+     /* FIXME: handle DPI scaling, somehow */
+     get_surface_rect( surface->hwnd, &client_rect, NtUserGetDpiForWindow( surface->hwnd ) );
+-    capabilities->minImageExtent.width = client_rect.right - client_rect.left;
+-    capabilities->minImageExtent.height = client_rect.bottom - client_rect.top;
+-    capabilities->maxImageExtent.width = client_rect.right - client_rect.left;
+-    capabilities->maxImageExtent.height = client_rect.bottom - client_rect.top;
+     capabilities->currentExtent.width = client_rect.right - client_rect.left;
+     capabilities->currentExtent.height = client_rect.bottom - client_rect.top;
++
++    /* Rotated Android swapchains use transposed image extents. */
++    preserve_host_extent_range = surface->surface_control &&
++        (host_transform == VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR ||
++         host_transform == VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR);
++
++    if (preserve_host_extent_range)
++    {
++        capabilities->minImageExtent = host_min_extent;
++        capabilities->maxImageExtent = host_max_extent;
++    }
++    else
++    {
++        capabilities->minImageExtent = capabilities->currentExtent;
++        capabilities->maxImageExtent = capabilities->currentExtent;
++    }
+ }
+ 
+ static VkResult win32u_vkGetPhysicalDeviceSurfaceCapabilitiesKHR( VkPhysicalDevice client_physical_device, VkSurfaceKHR client_surface,
+@@ -1800,6 +1925,10 @@ static VkResult win32u_vkGetPhysicalDeviceSurfaceCapabilitiesKHR( VkPhysicalDevi
+     VkResult res;
+ 
+     if (!NtUserIsWindow( surface->hwnd )) return VK_ERROR_SURFACE_LOST_KHR;
++    if (android_surface_generation_changed( surface ))
++    {
++        return VK_ERROR_SURFACE_LOST_KHR;
++    }
+     res = instance->p_vkGetPhysicalDeviceSurfaceCapabilitiesKHR( physical_device->host.physical_device,
+                                                        surface->obj.host.surface, capabilities );
+     if (!res) adjust_surface_capabilities( instance, surface, capabilities );
+@@ -1826,6 +1955,10 @@ static VkResult win32u_vkGetPhysicalDeviceSurfaceCapabilities2KHR( VkPhysicalDev
+     surface_info_host.surface = surface->obj.host.surface;
+ 
+     if (!NtUserIsWindow( surface->hwnd )) return VK_ERROR_SURFACE_LOST_KHR;
++    if (android_surface_generation_changed( surface ))
++    {
++        return VK_ERROR_SURFACE_LOST_KHR;
++    }
+     res = instance->p_vkGetPhysicalDeviceSurfaceCapabilities2KHR( physical_device->host.physical_device,
+                                                                      &surface_info_host, capabilities );
+     if (!res) adjust_surface_capabilities( instance, surface, &capabilities->surfaceCapabilities );
+@@ -2523,7 +2656,12 @@ fail:
+ 
+ static BOOL surface_get_fshack_dpi( struct surface *surface )
+ {
+-    UINT dpi = NtUserGetDpiForWindow( surface->hwnd ), raw = NtUserGetWinMonitorDpi( surface->hwnd, MDT_RAW_DPI );
++    UINT dpi, raw;
++
++    if (surface->surface_control) return 0;
++
++    dpi = NtUserGetDpiForWindow( surface->hwnd );
++    raw = NtUserGetWinMonitorDpi( surface->hwnd, MDT_RAW_DPI );
+     return fshack_enabled && dpi != raw ? raw : 0;
+ }
+ 
+@@ -2562,13 +2700,23 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
+      * display mode change emulation), MoltenVK's vkQueuePresentKHR returns VK_SUBOPTIMAL_KHR.
+      * Create the swapchain with VkSwapchainPresentScalingCreateInfoEXT to avoid this.
+      */
+-    if (get_surface_rect( surface->hwnd, &client_rect, NtUserGetWinMonitorDpi( surface->hwnd, MDT_WINE_RAW_DPI ) ) &&
+-        !extents_equals( &create_info_host.imageExtent, &client_rect ) &&
+-        instance->extensions.has_VK_EXT_surface_maintenance1 &&
+-        physical_device->extensions.has_VK_KHR_swapchain_maintenance1)
+-    {
+-        scaling.scalingBehavior = VK_PRESENT_SCALING_STRETCH_BIT_EXT;
+-        create_info_host.pNext = &scaling;
++    if (get_surface_rect( surface->hwnd, &client_rect, NtUserGetWinMonitorDpi( surface->hwnd, MDT_WINE_RAW_DPI ) ))
++    {
++        const UINT client_width = client_rect.right - client_rect.left;
++        const UINT client_height = client_rect.bottom - client_rect.top;
++        const BOOL pre_rotated_extent =
++            (create_info_host.preTransform == VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR ||
++             create_info_host.preTransform == VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR) &&
++            create_info_host.imageExtent.width == client_height &&
++            create_info_host.imageExtent.height == client_width;
++
++        if (!pre_rotated_extent && !extents_equals( &create_info_host.imageExtent, &client_rect ) &&
++            instance->extensions.has_VK_EXT_surface_maintenance1 &&
++            physical_device->extensions.has_VK_KHR_swapchain_maintenance1)
++        {
++            scaling.scalingBehavior = VK_PRESENT_SCALING_STRETCH_BIT_EXT;
++            create_info_host.pNext = &scaling;
++        }
+     }
+ 
+     if (!(swapchain = calloc( 1, sizeof(*swapchain) ))) return VK_ERROR_OUT_OF_HOST_MEMORY;
+@@ -2607,6 +2755,8 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
+     vulkan_object_init( &swapchain->obj.obj, host_swapchain );
+     swapchain->surface = surface;
+     swapchain->extents = create_info->imageExtent;
++    swapchain->pre_transform = create_info->preTransform;
++    swapchain->geometry_serial = surface_geometry_serial( surface );
+     instance->p_insert_object( instance, &swapchain->obj.obj );
+ 
+     if (swapchain->fshack_dpi)
+@@ -2685,11 +2835,25 @@ static VkResult win32u_vkAcquireNextImage2KHR( VkDevice client_device, const VkA
+     RECT client_rect;
+     VkResult res;
+ 
++    if (surface->surface_control && android_surface_generation_changed( surface ))
++    {
++        return VK_ERROR_SURFACE_LOST_KHR;
++    }
++
+     acquire_info_host.swapchain = swapchain->obj.host.swapchain;
+     acquire_info_host.semaphore = semaphore ? semaphore->host.semaphore : 0;
+     acquire_info_host.fence = fence ? fence->host.fence : 0;
+     res = device->p_vkAcquireNextImage2KHR( device->host.device, &acquire_info_host, image_index );
+ 
++    if (!res && surface->surface_control)
++    {
++        if (swapchain_geometry_changed( swapchain ))
++        {
++            return VK_SUBOPTIMAL_KHR;
++        }
++        return res;
++    }
++
+     if (!res && swapchain->fshack_dpi != surface_get_fshack_dpi( surface ))
+     {
+         WARN( "window %p swapchain %p needs fullscreen hack VK_SUBOPTIMAL_KHR\n", surface->hwnd, swapchain );
+@@ -2697,7 +2861,7 @@ static VkResult win32u_vkAcquireNextImage2KHR( VkDevice client_device, const VkA
+     }
+ 
+     if (!res && get_surface_rect( surface->hwnd, &client_rect, NtUserGetDpiForWindow( surface->hwnd ) ) &&
+-        !extents_equals( &swapchain->extents, &client_rect ))
++        !swapchain_extent_matches_client( swapchain, &client_rect ))
+     {
+         WARN( "Swapchain size %dx%d does not match client rect %s, returning VK_SUBOPTIMAL_KHR\n",
+               swapchain->extents.width, swapchain->extents.height, wine_dbgstr_rect( &client_rect ) );
+@@ -2718,10 +2882,24 @@ static VkResult win32u_vkAcquireNextImageKHR( VkDevice client_device, VkSwapchai
+     RECT client_rect;
+     VkResult res;
+ 
++    if (surface->surface_control && android_surface_generation_changed( surface ))
++    {
++        return VK_ERROR_SURFACE_LOST_KHR;
++    }
++
+     res = device->p_vkAcquireNextImageKHR( device->host.device, swapchain->obj.host.swapchain, timeout,
+                                               semaphore ? semaphore->host.semaphore : 0, fence ? fence->host.fence : 0,
+                                               image_index );
+ 
++    if (!res && surface->surface_control)
++    {
++        if (swapchain_geometry_changed( swapchain ))
++        {
++            return VK_SUBOPTIMAL_KHR;
++        }
++        return res;
++    }
++
+     if (!res && swapchain->fshack_dpi != surface_get_fshack_dpi( surface ))
+     {
+         WARN( "window %p swapchain %p needs fullscreen hack VK_SUBOPTIMAL_KHR\n", surface->hwnd, swapchain );
+@@ -2729,7 +2907,7 @@ static VkResult win32u_vkAcquireNextImageKHR( VkDevice client_device, VkSwapchai
+     }
+ 
+     if (!res && get_surface_rect( surface->hwnd, &client_rect, NtUserGetDpiForWindow( surface->hwnd ) ) &&
+-        !extents_equals( &swapchain->extents, &client_rect ))
++        !swapchain_extent_matches_client( swapchain, &client_rect ))
+     {
+         WARN( "Swapchain size %dx%d does not match client rect %s, returning VK_SUBOPTIMAL_KHR\n",
+               swapchain->extents.width, swapchain->extents.height, wine_dbgstr_rect( &client_rect ) );
+@@ -2923,6 +3101,15 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
+ 
+     TRACE( "queue %p, present_info %p\n", queue, present_info );
+ 
++    for (uint32_t i = 0; i < present_info->swapchainCount; ++i)
++    {
++        struct swapchain *swapchain = swapchain_from_handle( present_info->pSwapchains[i] );
++        if (swapchain->surface->surface_control && android_surface_generation_changed( swapchain->surface ))
++        {
++            return VK_ERROR_SURFACE_LOST_KHR;
++        }
++    }
++
+     if (!(swapchains = mem_alloc( &pool, present_info->swapchainCount * sizeof(*swapchains) ))) return VK_ERROR_OUT_OF_HOST_MEMORY;
+     if (!(blit_cmds = mem_alloc( &pool, present_info->swapchainCount * sizeof(blit_cmds) ))) goto failed;
+ 
+@@ -2972,7 +3159,7 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
+     {
+         struct swapchain *swapchain = swapchain_from_handle( client_swapchains[i] );
+         struct surface *surface = swapchain->surface;
+-        client_surface_update( surface->client );
++        if (!surface->surface_control) client_surface_update( surface->client );
+     }
+ 
+     if (blit_count)
+@@ -3008,6 +3195,16 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
+         struct surface *surface = swapchain->surface;
+         RECT client_rect;
+ 
++        if (surface->surface_control)
++        {
++            if (swapchain_res >= VK_SUCCESS && swapchain_geometry_changed( swapchain ))
++            {
++                if (present_info->pResults) present_info->pResults[i] = VK_SUBOPTIMAL_KHR;
++                if (!res) res = VK_SUBOPTIMAL_KHR;
++            }
++            continue;
++        }
++
+         client_surface_present( surface->client );
+ 
+         if (swapchain_res < VK_SUCCESS) continue;
+@@ -3019,7 +3216,7 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
+         }
+         else if (swapchain_res)
+             WARN( "Present returned status %d for swapchain %p\n", swapchain_res, swapchain );
+-        else if (!extents_equals( &swapchain->extents, &client_rect ))
++        else if (!swapchain_extent_matches_client( swapchain, &client_rect ))
+         {
+             WARN( "Swapchain size %dx%d does not match client rect %s, returning VK_SUBOPTIMAL_KHR\n",
+                   swapchain->extents.width, swapchain->extents.height, wine_dbgstr_rect( &client_rect ) );
+@@ -4098,6 +4295,12 @@ static void vulkan_init_once(void)
+     for (uint32_t i = 0; i < count; i++)
+     {
+         const char *extension = properties[i].extensionName;
++        if (!strcmp( extension, "VK_KHR_android_surface" ))
++        {
++            android_host_surface = TRUE;
++            TRACE( "  - %s\n", extension );
++            continue;
++        }
+ #define USE_VK_EXT(x)                           \
+         if (!strcmp( extension, #x ))           \
+         {                                       \
+@@ -4110,6 +4313,8 @@ static void vulkan_init_once(void)
+     }
+     vulkan_funcs.host_extensions = extensions;
+ 
++    if (android_direct_present() && android_host_surface)
++        extensions.has_VK_KHR_win32_surface = 1;
+     /* map host instance extensions for VK_KHR_win32_surface */
+     driver_funcs->p_map_instance_extensions( &extensions );
+ 

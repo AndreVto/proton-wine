@@ -1,0 +1,27 @@
+diff --git a/loader/main.c b/loader/main.c
+index 2775c078d96..31ae61e0246 100644
+--- a/loader/main.c
++++ b/loader/main.c
+@@ -39,6 +39,7 @@
+ #endif
+ 
+ #include "main.h"
++#include "process_relay.h"
+ 
+ #if defined(__APPLE__) && defined(__x86_64__) && !defined(HAVE_WINE_PRELOADER)
+ 
+@@ -184,8 +185,14 @@ static void *try_dlopen( const char *argv0 )
+  */
+ int main( int argc, char *argv[] )
+ {
++    int relay_status;
+     void *handle;
+ 
++    if ((relay_status = wine_process_relay( argc, argv )) > 0)
++        exit( 0 );
++    else if (relay_status < 0)
++        fprintf( stderr, "wine: child process relay failed (%d), falling back to the normal loader\n", relay_status );
++
+     init_reserved_areas();
+ 
+     if ((handle = try_dlopen( get_self_exe() )) ||

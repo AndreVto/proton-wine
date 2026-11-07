@@ -1,0 +1,14 @@
+diff --git a/dlls/winebus.sys/unixlib.h b/dlls/winebus.sys/unixlib.h
+index ad3b268b0b6..de7c456a38f 100644
+--- a/dlls/winebus.sys/unixlib.h
++++ b/dlls/winebus.sys/unixlib.h
+@@ -147,6 +147,9 @@ enum unix_funcs
+     iohid_init,
+     iohid_wait,
+     iohid_stop,
++    android_init,
++    android_wait,
++    android_stop,
+     mouse_create,
+     keyboard_create,
+     device_remove,

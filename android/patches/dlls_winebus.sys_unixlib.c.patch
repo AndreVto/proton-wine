@@ -1,0 +1,14 @@
+diff --git a/dlls/winebus.sys/unixlib.c b/dlls/winebus.sys/unixlib.c
+index bd4351f059c..6048b42e2f9 100644
+--- a/dlls/winebus.sys/unixlib.c
++++ b/dlls/winebus.sys/unixlib.c
+@@ -311,6 +311,9 @@ const unixlib_entry_t __wine_unix_call_funcs[] =
+     iohid_bus_init,
+     iohid_bus_wait,
+     iohid_bus_stop,
++    android_bus_init,
++    android_bus_wait,
++    android_bus_stop,
+     mouse_device_create,
+     keyboard_device_create,
+     unix_device_remove,

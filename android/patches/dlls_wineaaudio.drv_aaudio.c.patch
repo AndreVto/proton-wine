@@ -1,0 +1,2561 @@
+diff --git a/dlls/wineaaudio.drv/aaudio.c b/dlls/wineaaudio.drv/aaudio.c
+new file mode 100644
+index 00000000000..346944d12c0
+--- /dev/null
++++ b/dlls/wineaaudio.drv/aaudio.c
+@@ -0,0 +1,2555 @@
++/*
++ * Android AAudio driver (unixlib)
++ *
++ * Copyright 2026
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++
++#if 0
++#pragma makedep unix
++#endif
++
++#include "config.h"
++
++#include <aaudio/AAudio.h>
++
++#include <dlfcn.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <math.h>
++#include <pthread.h>
++#include <semaphore.h>
++#include <stdio.h>
++#include <stdint.h>
++#include <stddef.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/mman.h>
++#include <sys/stat.h>
++#include <time.h>
++#include <unistd.h>
++
++#include "ntstatus.h"
++#define WIN32_NO_STATUS
++#include "windef.h"
++#include "winbase.h"
++#include "winternl.h"
++#include "mmdeviceapi.h"
++#include "audioclient.h"
++#include "mmreg.h"
++#include "ks.h"
++#include "ksmedia.h"
++#include "propkey.h"
++#include "devpkey.h"
++#include "propvarutil.h"
++#include "wine/debug.h"
++#include "wine/unixlib.h"
++#include "../mmdevapi/unixlib.h"
++#include "game_audio_capture_shared.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(aaudio);
++
++#define DEFAULT_RATE 48000
++#define DEFAULT_RENDER_CHANNELS 2
++#define DEFAULT_CAPTURE_CHANNELS 1
++#define DEFAULT_PERIOD_100NS 100000 /* 10 ms */
++#define MIN_PERIOD_100NS 30000      /* 3 ms */
++#define MAX_CHANNELS 32
++#define STATE_WAIT_NS 1000000000LL /* 1 second */
++
++
++#define AUDIO_DEVICE_MAGIC 0x56444141u
++#define AUDIO_DEVICE_VERSION 1u
++#define AUDIO_DEVICE_MAX 64
++#define AUDIO_DEVICE_NAME_UNITS 64
++#define AUDIO_DEVICE_FLAG_SINK 1u
++#define AUDIO_DEVICE_FLAG_SOURCE 2u
++
++struct android_audio_device_record
++{
++    UINT64 stable_id;
++    int32_t device_id;
++    UINT32 type;
++    UINT32 flags;
++    UINT32 reserved;
++    WCHAR name[AUDIO_DEVICE_NAME_UNITS];
++};
++
++struct android_audio_device_table
++{
++    UINT32 magic;
++    UINT32 version;
++    volatile UINT32 sequence;
++    UINT32 count;
++    struct android_audio_device_record devices[AUDIO_DEVICE_MAX];
++};
++
++struct android_audio_device_snapshot
++{
++    UINT32 count;
++    struct android_audio_device_record devices[AUDIO_DEVICE_MAX];
++};
++
++C_ASSERT(sizeof(struct android_audio_device_record) == 152);
++C_ASSERT(offsetof(struct android_audio_device_table, sequence) == 8);
++
++/* Unixlib cannot reference GUIDs exported by Windows-side DLLs. */
++static const GUID aaudio_subtype_pcm =
++    {0x00000001, 0x0000, 0x0010, {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}};
++static const GUID aaudio_subtype_ieee_float =
++    {0x00000003, 0x0000, 0x0010, {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}};
++static const PROPERTYKEY aaudio_devpkey_device_container_id =
++    {{0x8c7ed206, 0x3f8a, 0x4827, {0xb3, 0xab, 0xae, 0x9e, 0x1f, 0xae, 0xfc, 0x6c}}, 2};
++
++static ULONG_PTR zero_bits;
++static int audio_devices_fd = -1;
++static const struct android_audio_device_table *audio_devices;
++static int audio_capture_fd = -1;
++static struct android_audio_capture_shared *audio_capture;
++static volatile LONGLONG audio_capture_next_token;
++
++/* Serialize native stream lifecycle transitions across WASAPI clients. */
++static pthread_mutex_t aaudio_lifecycle_mutex = PTHREAD_MUTEX_INITIALIZER;
++
++struct aaudio_stream
++{
++    AAudioStream *native;
++    pthread_mutex_t mutex;
++    sem_t event_sem;
++    EDataFlow flow;
++    UINT64 device_key;
++    AUDCLNT_SHAREMODE share;
++    DWORD flags;
++    WAVEFORMATEXTENSIBLE fmt;
++    UINT32 rate;
++    UINT32 channels;
++    UINT32 frame_size;
++    UINT32 buffer_frames;
++    UINT32 period_frames;
++    UINT64 render_read_frames;
++    UINT64 render_write_frames;
++    UINT64 capture_read_frames;
++    UINT64 capture_write_frames;
++    UINT64 capture_reported_lost_frames;
++    UINT64 locked_capture_lost_frames;
++    BYTE *buffer;
++    BYTE *tmp_buffer;
++    UINT32 tmp_frames;
++    BYTE *locked_data;
++    UINT32 locked_frames;
++    BOOL locked_tmp;
++    BOOL render_zero_pending;
++    BOOL reset_complete;
++    BOOL is_float;
++    BOOL started;
++    LONG disconnected;
++    LONG endpoint_invalidated;
++    LONG last_native_error;
++    LONG event_pending;
++    BOOL quitting;
++    HANDLE event;
++    volatile LONGLONG device_frames;
++    UINT64 clock_position_frames;
++    UINT64 clock_start_frames;
++    UINT64 clock_native_start_frames;
++    UINT64 clock_callback_start_frames;
++    UINT64 clock_qpc_100ns;
++    BOOL clock_has_timestamp;
++    volatile LONGLONG capture_lost_frames;
++    volatile LONGLONG render_underrun_frames;
++    UINT32 event_frames;
++    float volumes[MAX_CHANNELS];
++    struct android_audio_capture_slot *capture_slot;
++    UINT64 capture_owner_token;
++};
++
++static struct aaudio_stream *stream_from_handle(stream_handle handle)
++{
++    return (struct aaudio_stream *)(ULONG_PTR)handle;
++}
++
++static void *low_alloc(SIZE_T bytes)
++{
++    void *ptr = NULL;
++    SIZE_T size = bytes;
++    if (!bytes) return NULL;
++    if (NtAllocateVirtualMemory(NtCurrentProcess(), &ptr, zero_bits, &size,
++                                MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE))
++        return NULL;
++    return ptr;
++}
++
++static void low_free(void *ptr)
++{
++    SIZE_T size = 0;
++    if (ptr) NtFreeVirtualMemory(NtCurrentProcess(), &ptr, &size, MEM_RELEASE);
++}
++
++static UINT32 frames_from_100ns(REFERENCE_TIME time, UINT32 rate)
++{
++    UINT64 frames;
++    if (time <= 0) return 0;
++    if ((UINT64)time / 10000000 >= UINT32_MAX / rate) return UINT32_MAX;
++    frames = ((UINT64)time / 10000000) * rate;
++    frames += (((UINT64)time % 10000000) * rate + 9999999) / 10000000;
++    return frames > UINT32_MAX ? UINT32_MAX : (UINT32)frames;
++}
++
++static UINT channel_mask(UINT channels)
++{
++    switch (channels)
++    {
++    case 1: return SPEAKER_FRONT_CENTER;
++    case 2: return KSAUDIO_SPEAKER_STEREO;
++    case 4: return KSAUDIO_SPEAKER_QUAD;
++    case 6: return KSAUDIO_SPEAKER_5POINT1_SURROUND;
++    case 8: return KSAUDIO_SPEAKER_7POINT1_SURROUND;
++    default: return 0;
++    }
++}
++
++static void fill_mix_format(EDataFlow flow, WAVEFORMATEXTENSIBLE *fmt)
++{
++    UINT channels = flow == eCapture ? DEFAULT_CAPTURE_CHANNELS : DEFAULT_RENDER_CHANNELS;
++    memset(fmt, 0, sizeof(*fmt));
++    fmt->Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
++    fmt->Format.nChannels = channels;
++    fmt->Format.nSamplesPerSec = DEFAULT_RATE;
++    fmt->Format.wBitsPerSample = 32;
++    fmt->Format.nBlockAlign = channels * sizeof(float);
++    fmt->Format.nAvgBytesPerSec = fmt->Format.nSamplesPerSec * fmt->Format.nBlockAlign;
++    fmt->Format.cbSize = sizeof(*fmt) - sizeof(fmt->Format);
++    fmt->Samples.wValidBitsPerSample = 32;
++    fmt->dwChannelMask = channel_mask(channels);
++    fmt->SubFormat = aaudio_subtype_ieee_float;
++}
++
++static BOOL get_format(const WAVEFORMATEX *fmt, UINT32 *rate, UINT32 *channels,
++                       UINT32 *frame_size, BOOL *is_float)
++{
++    const WAVEFORMATEXTENSIBLE *ext;
++    GUID subtype;
++
++    UINT64 expected_bytes;
++
++    if (!fmt || !fmt->nChannels || fmt->nChannels > MAX_CHANNELS || !fmt->nSamplesPerSec)
++        return FALSE;
++
++    if (fmt->wFormatTag == WAVE_FORMAT_EXTENSIBLE)
++    {
++        if (fmt->cbSize < sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)) return FALSE;
++        ext = (const WAVEFORMATEXTENSIBLE *)fmt;
++        if (!ext->Samples.wValidBitsPerSample ||
++            ext->Samples.wValidBitsPerSample > fmt->wBitsPerSample)
++            return FALSE;
++        if (ext->dwChannelMask && __builtin_popcount(ext->dwChannelMask) != fmt->nChannels)
++            return FALSE;
++        subtype = ext->SubFormat;
++    }
++    else if (fmt->wFormatTag == WAVE_FORMAT_IEEE_FLOAT)
++        subtype = aaudio_subtype_ieee_float;
++    else if (fmt->wFormatTag == WAVE_FORMAT_PCM)
++        subtype = aaudio_subtype_pcm;
++    else
++        return FALSE;
++
++    if (IsEqualGUID(&subtype, &aaudio_subtype_ieee_float))
++    {
++        if (fmt->wBitsPerSample != 32) return FALSE;
++        *is_float = TRUE;
++    }
++    else if (IsEqualGUID(&subtype, &aaudio_subtype_pcm))
++    {
++        if (fmt->wBitsPerSample != 16) return FALSE;
++        *is_float = FALSE;
++    }
++    else return FALSE;
++
++    if (fmt->nBlockAlign != fmt->nChannels * fmt->wBitsPerSample / 8) return FALSE;
++    expected_bytes = (UINT64)fmt->nSamplesPerSec * fmt->nBlockAlign;
++    if (expected_bytes > UINT32_MAX || fmt->nAvgBytesPerSec != expected_bytes) return FALSE;
++    *rate = fmt->nSamplesPerSec;
++    *channels = fmt->nChannels;
++    *frame_size = fmt->nBlockAlign;
++    return TRUE;
++}
++
++
++static UINT64 monotonic_ns(void)
++{
++    struct timespec ts;
++    if (clock_gettime(CLOCK_MONOTONIC, &ts)) return 0;
++    return (UINT64)ts.tv_sec * 1000000000ULL + (UINT64)ts.tv_nsec;
++}
++
++static void audio_capture_release_stream(struct aaudio_stream *stream)
++{
++    struct android_audio_capture_slot *slot = stream->capture_slot;
++    UINT64 write_pos, read_pos;
++
++    if (!slot) return;
++    if (android_audio_atomic_load_u64(&slot->owner_token) != stream->capture_owner_token)
++    {
++        stream->capture_slot = NULL;
++        stream->capture_owner_token = 0;
++        return;
++    }
++
++    write_pos = android_audio_atomic_load_u64(&slot->write_pos);
++    read_pos = android_audio_atomic_load_u64(&slot->read_pos);
++    android_audio_atomic_store_u32(&slot->state,
++                                write_pos == read_pos ? ANDROID_AUDIO_CAPTURE_SLOT_FREE
++                                                      : ANDROID_AUDIO_CAPTURE_SLOT_RETIRED);
++    stream->capture_slot = NULL;
++    stream->capture_owner_token = 0;
++}
++
++static void audio_capture_claim_stream(struct aaudio_stream *stream)
++{
++    UINT32 sample_format, i;
++    UINT64 token;
++    BOOL is_float;
++    UINT32 rate, channels, frame_size;
++
++    if (!audio_capture || stream->flow != eRender || stream->capture_slot) return;
++    if (!get_format(&stream->fmt.Format, &rate, &channels, &frame_size, &is_float)) return;
++    sample_format = is_float ? ANDROID_AUDIO_CAPTURE_FORMAT_F32 : ANDROID_AUDIO_CAPTURE_FORMAT_S16;
++    token = ((UINT64)(UINT32)getpid() << 32) ^
++            (UINT64)InterlockedIncrement64(&audio_capture_next_token);
++
++    for (i = 0; i < min(audio_capture->slot_count, ANDROID_AUDIO_CAPTURE_SLOT_COUNT); ++i)
++    {
++        struct android_audio_capture_slot *slot = &audio_capture->slots[i];
++        UINT32 expected = ANDROID_AUDIO_CAPTURE_SLOT_FREE;
++        if (!__atomic_compare_exchange_n(&slot->state, &expected,
++                                         ANDROID_AUDIO_CAPTURE_SLOT_CLAIMING, FALSE,
++                                         __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
++            continue;
++
++        slot->owner_pid = (UINT32)getpid();
++        android_audio_atomic_store_u64(&slot->owner_token, token);
++        slot->sample_rate = rate;
++        slot->channels = channels;
++        slot->sample_format = sample_format;
++        slot->frame_size = frame_size;
++        slot->channel_mask = stream->fmt.Format.wFormatTag == WAVE_FORMAT_EXTENSIBLE
++            ? stream->fmt.dwChannelMask : channel_mask(channels);
++        slot->format_reserved = 0;
++        android_audio_atomic_store_u32(&slot->producer_active, 0);
++        slot->producer_reserved = 0;
++        slot->stream_epoch = token;
++        android_audio_atomic_store_u64(&slot->write_pos, 0);
++        android_audio_atomic_store_u64(&slot->read_pos, 0);
++        android_audio_atomic_store_u64(&slot->dropped_frames, 0);
++        android_audio_atomic_store_u64(&slot->producer_frames, 0);
++        __atomic_store_n(&slot->timestamp_sequence, 0, __ATOMIC_RELAXED);
++        slot->timestamp_status = 0;
++        slot->timestamp_frame_position = 0;
++        slot->timestamp_ns = 0;
++
++        stream->capture_slot = slot;
++        stream->capture_owner_token = token;
++        android_audio_atomic_store_u32(&slot->state, ANDROID_AUDIO_CAPTURE_SLOT_ACTIVE);
++        return;
++    }
++
++    WARN("no free Android audio capture slot for render stream %p\n", stream);
++}
++
++static void audio_capture_write(struct aaudio_stream *stream, const void *audio_data,
++                                UINT32 frames, UINT64 stream_frame_position)
++{
++    struct android_audio_capture_slot *slot = stream->capture_slot;
++    struct android_audio_capture_packet packet;
++    UINT64 session_serial;
++    UINT32 payload_bytes, remaining;
++
++    if (!audio_capture || !slot || !frames) return;
++    if (!android_audio_atomic_load_u32(&audio_capture->enabled)) return;
++    session_serial = android_audio_atomic_load_u64(&audio_capture->session_serial);
++    if (!session_serial) return;
++
++    android_audio_atomic_add_u32(&audio_capture->writers_inflight, 1);
++    if (!android_audio_atomic_load_u32(&audio_capture->enabled) ||
++        android_audio_atomic_load_u64(&audio_capture->session_serial) != session_serial ||
++        android_audio_atomic_load_u32(&slot->state) != ANDROID_AUDIO_CAPTURE_SLOT_ACTIVE ||
++        android_audio_atomic_load_u64(&slot->owner_token) != stream->capture_owner_token)
++    {
++        android_audio_atomic_sub_u32(&audio_capture->writers_inflight, 1);
++        return;
++    }
++
++    if (!stream->frame_size || frames > UINT32_MAX / stream->frame_size)
++    {
++        android_audio_atomic_add_u64(&slot->dropped_frames, frames);
++        android_audio_atomic_sub_u32(&audio_capture->writers_inflight, 1);
++        return;
++    }
++
++    payload_bytes = frames * stream->frame_size;
++    packet.session_serial = session_serial;
++    packet.stream_frame_position = stream_frame_position;
++    packet.callback_time_ns = monotonic_ns();
++    packet.frames = frames;
++    packet.payload_bytes = payload_bytes;
++
++    /* The recorder polls the SPSC ring; no wake-up is issued from the audio callback. */
++    android_audio_capture_write_packet(slot, &packet, audio_data);
++    remaining = android_audio_atomic_sub_u32(&audio_capture->writers_inflight, 1);
++    (void)remaining;
++}
++
++
++static void map_audio_capture(void)
++{
++    const char *path = getenv("WINE_ANDROID_AUDIO_CAPTURE_SHM");
++    struct stat statbuf;
++    void *mapped;
++
++    if (!path || !path[0]) return;
++    audio_capture_fd = open(path, O_RDWR | O_CLOEXEC);
++    if (audio_capture_fd < 0)
++    {
++        WARN("could not open Android audio capture transport %s: %d\n", path, errno);
++        return;
++    }
++    if (fstat(audio_capture_fd, &statbuf) || statbuf.st_size < sizeof(*audio_capture))
++    {
++        WARN("invalid Android audio capture transport %s\n", path);
++        close(audio_capture_fd);
++        audio_capture_fd = -1;
++        return;
++    }
++    mapped = mmap(NULL, sizeof(*audio_capture), PROT_READ | PROT_WRITE, MAP_SHARED,
++                  audio_capture_fd, 0);
++    if (mapped == MAP_FAILED)
++    {
++        WARN("could not map Android audio capture transport %s: %d\n", path, errno);
++        close(audio_capture_fd);
++        audio_capture_fd = -1;
++        return;
++    }
++    audio_capture = mapped;
++    if (audio_capture->magic != ANDROID_AUDIO_CAPTURE_MAGIC ||
++        audio_capture->version != ANDROID_AUDIO_CAPTURE_VERSION ||
++        audio_capture->slot_count > ANDROID_AUDIO_CAPTURE_SLOT_COUNT ||
++        audio_capture->ring_bytes != ANDROID_AUDIO_CAPTURE_RING_BYTES)
++    {
++        WARN("unsupported Android audio capture transport %s\n", path);
++        munmap(audio_capture, sizeof(*audio_capture));
++        audio_capture = NULL;
++        close(audio_capture_fd);
++        audio_capture_fd = -1;
++    }
++}
++
++static void copy_capture_ring_out(struct aaudio_stream *stream, BYTE *dst,
++                                  UINT64 read_frames, UINT32 frames)
++{
++    UINT32 pos = (UINT32)(read_frames % stream->buffer_frames);
++    UINT32 first = min(frames, stream->buffer_frames - pos);
++    memcpy(dst, stream->buffer + (SIZE_T)pos * stream->frame_size,
++           (SIZE_T)first * stream->frame_size);
++    if (first < frames)
++        memcpy(dst + (SIZE_T)first * stream->frame_size, stream->buffer,
++               (SIZE_T)(frames - first) * stream->frame_size);
++}
++
++static void copy_render_ring_out(struct aaudio_stream *stream, BYTE *dst, UINT64 read_frames, UINT32 frames)
++{
++    UINT32 pos = (UINT32)(read_frames % stream->buffer_frames);
++    UINT32 first = min(frames, stream->buffer_frames - pos);
++    memcpy(dst, stream->buffer + (SIZE_T)pos * stream->frame_size,
++           (SIZE_T)first * stream->frame_size);
++    if (first < frames)
++        memcpy(dst + (SIZE_T)first * stream->frame_size, stream->buffer,
++               (SIZE_T)(frames - first) * stream->frame_size);
++}
++
++static void write_capture_ring(struct aaudio_stream *stream, const BYTE *src, UINT32 frames)
++{
++    UINT64 write_frames = __atomic_load_n(&stream->capture_write_frames, __ATOMIC_RELAXED);
++    UINT64 read_frames = __atomic_load_n(&stream->capture_read_frames, __ATOMIC_ACQUIRE);
++    UINT32 available = stream->buffer_frames - (UINT32)(write_frames - read_frames);
++    UINT32 take = min(frames, available);
++    UINT32 pos = (UINT32)(write_frames % stream->buffer_frames);
++    UINT32 first = min(take, stream->buffer_frames - pos);
++
++    if (first)
++        memcpy(stream->buffer + (SIZE_T)pos * stream->frame_size, src,
++               (SIZE_T)first * stream->frame_size);
++    if (first < take)
++        memcpy(stream->buffer, src + (SIZE_T)first * stream->frame_size,
++               (SIZE_T)(take - first) * stream->frame_size);
++    if (take)
++        __atomic_store_n(&stream->capture_write_frames, write_frames + take, __ATOMIC_RELEASE);
++    /* Preserve outstanding capture packets; discard new samples when the ring is full. */
++    if (take < frames)
++        InterlockedAdd64(&stream->capture_lost_frames, frames - take);
++}
++
++static void signal_audio_event(struct aaudio_stream *stream)
++{
++    if (!InterlockedExchange(&stream->event_pending, TRUE)) sem_post(&stream->event_sem);
++}
++
++static void apply_volume(struct aaudio_stream *stream, void *buffer, UINT32 frames)
++{
++    UINT32 channels = stream->channels, i, c;
++    float gains[MAX_CHANNELS];
++    for (c = 0; c < channels; ++c)
++        __atomic_load(&stream->volumes[c], &gains[c], __ATOMIC_RELAXED);
++
++    if (stream->is_float)
++    {
++        float *samples = buffer;
++        for (i = 0; i < frames; ++i)
++            for (c = 0; c < channels; ++c)
++                samples[(SIZE_T)i * channels + c] *= gains[c];
++    }
++    else
++    {
++        int16_t *samples = buffer;
++        for (i = 0; i < frames; ++i)
++        {
++            for (c = 0; c < channels; ++c)
++            {
++                float v = samples[(SIZE_T)i * channels + c] * gains[c];
++                if (v > 32767.0f) v = 32767.0f;
++                else if (v < -32768.0f) v = -32768.0f;
++                samples[(SIZE_T)i * channels + c] = (int16_t)lrintf(v);
++            }
++        }
++    }
++}
++
++static BOOL stream_disconnected(struct aaudio_stream *stream)
++{
++    return InterlockedCompareExchange(&stream->disconnected, FALSE, FALSE) != FALSE;
++}
++
++static BOOL stream_endpoint_invalidated(struct aaudio_stream *stream)
++{
++    return InterlockedCompareExchange(&stream->endpoint_invalidated, FALSE, FALSE) ||
++           (__atomic_load_n(&stream->native, __ATOMIC_ACQUIRE) && stream_disconnected(stream));
++}
++
++static void atomic_store64(volatile LONGLONG *value, LONGLONG new_value)
++{
++    LONGLONG old_value = InterlockedCompareExchange64(value, 0, 0);
++
++    while (InterlockedCompareExchange64(value, new_value, old_value) != old_value)
++        old_value = InterlockedCompareExchange64(value, 0, 0);
++}
++
++static UINT64 qpc_to_100ns(LONGLONG counter, LONGLONG frequency)
++{
++    UINT64 value, freq, quotient, remainder;
++
++    if (counter < 0 || frequency <= 0) return 0;
++
++    value = (UINT64)counter;
++    freq = (UINT64)frequency;
++    quotient = value / freq;
++    remainder = value % freq;
++
++    return quotient * 10000000ULL + remainder * 10000000ULL / freq;
++}
++
++static UINT64 audio_clock_qpc_now(void)
++{
++    LARGE_INTEGER counter, frequency;
++
++    if (NtQueryPerformanceCounter(&counter, &frequency)) return 0;
++    return qpc_to_100ns(counter.QuadPart, frequency.QuadPart);
++}
++
++static UINT64 audio_clock_native_frames(struct aaudio_stream *stream)
++{
++    int64_t frames;
++
++    if (!stream->native) return 0;
++    frames = stream->flow == eRender ? AAudioStream_getFramesRead(stream->native)
++                                      : AAudioStream_getFramesWritten(stream->native);
++    return frames > 0 ? (UINT64)frames : 0;
++}
++
++static void audio_clock_begin_start(struct aaudio_stream *stream)
++{
++    stream->clock_start_frames = stream->clock_position_frames;
++    stream->clock_native_start_frames = audio_clock_native_frames(stream);
++    stream->clock_callback_start_frames = (UINT64)InterlockedCompareExchange64(&stream->device_frames, 0, 0);
++    stream->clock_has_timestamp = FALSE;
++}
++
++static BOOL audio_clock_poll_timestamp(struct aaudio_stream *stream)
++{
++    int64_t native_position, native_time_ns;
++    struct timespec now;
++    UINT64 frames, now_ns, age_100ns, now_qpc, timestamp_qpc;
++    aaudio_result_t result;
++
++    if (!stream->native || stream_disconnected(stream)) return FALSE;
++    result = AAudioStream_getTimestamp(stream->native, CLOCK_MONOTONIC,
++                                       &native_position, &native_time_ns);
++    if (result != AAUDIO_OK || native_position < 0 || native_time_ns <= 0 ||
++        (UINT64)native_position < stream->clock_native_start_frames)
++        return FALSE;
++
++    if (clock_gettime(CLOCK_MONOTONIC, &now)) return FALSE;
++    now_ns = (UINT64)now.tv_sec * 1000000000ULL + (UINT64)now.tv_nsec;
++    if ((UINT64)native_time_ns > now_ns) return FALSE;
++
++    now_qpc = audio_clock_qpc_now();
++    age_100ns = (now_ns - (UINT64)native_time_ns) / 100;
++    if (now_qpc < age_100ns) return FALSE;
++    timestamp_qpc = now_qpc - age_100ns;
++
++    frames = stream->clock_start_frames + (UINT64)native_position - stream->clock_native_start_frames;
++    stream->clock_has_timestamp = TRUE;
++    if (frames >= stream->clock_position_frames)
++    {
++        stream->clock_position_frames = frames;
++        stream->clock_qpc_100ns = max(timestamp_qpc, stream->clock_qpc_100ns);
++    }
++    return TRUE;
++}
++
++static void audio_clock_update(struct aaudio_stream *stream)
++{
++    UINT64 callback_frames, frames;
++    int32_t buffer_frames;
++
++    if (!stream->started) return;
++    if (audio_clock_poll_timestamp(stream)) return;
++    stream->clock_has_timestamp = FALSE;
++
++    callback_frames = (UINT64)InterlockedCompareExchange64(&stream->device_frames, 0, 0);
++    frames = callback_frames >= stream->clock_callback_start_frames
++             ? callback_frames - stream->clock_callback_start_frames : 0;
++    if (stream->flow == eRender && stream->native)
++    {
++        buffer_frames = AAudioStream_getBufferSizeInFrames(stream->native);
++        if (buffer_frames > 0)
++            frames = frames > (UINT32)buffer_frames ? frames - (UINT32)buffer_frames : 0;
++    }
++    frames += stream->clock_start_frames;
++    if (frames > stream->clock_position_frames)
++    {
++        stream->clock_position_frames = frames;
++        stream->clock_qpc_100ns = audio_clock_qpc_now();
++    }
++}
++
++static BOOL read_audio_device_snapshot(struct android_audio_device_snapshot *snapshot)
++{
++    unsigned int attempt;
++
++    if (!audio_devices || audio_devices->magic != AUDIO_DEVICE_MAGIC ||
++        audio_devices->version != AUDIO_DEVICE_VERSION)
++        return FALSE;
++
++    for (attempt = 0; attempt < 32; ++attempt)
++    {
++        UINT32 before = __atomic_load_n(&audio_devices->sequence, __ATOMIC_ACQUIRE);
++        UINT32 count;
++        UINT32 after;
++
++        if (before & 1) continue;
++        count = min(audio_devices->count, (UINT32)AUDIO_DEVICE_MAX);
++        snapshot->count = count;
++        memcpy(snapshot->devices, audio_devices->devices,
++               count * sizeof(snapshot->devices[0]));
++        __atomic_thread_fence(__ATOMIC_ACQUIRE);
++        after = __atomic_load_n(&audio_devices->sequence, __ATOMIC_ACQUIRE);
++        if (before == after && !(after & 1)) return TRUE;
++    }
++    return FALSE;
++}
++
++static UINT32 device_flow_flag(EDataFlow flow)
++{
++    return flow == eCapture ? AUDIO_DEVICE_FLAG_SOURCE : AUDIO_DEVICE_FLAG_SINK;
++}
++
++static int hex_value(char c)
++{
++    if (c >= '0' && c <= '9') return c - '0';
++    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
++    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
++    return -1;
++}
++
++static BOOL parse_device_key(const char *device, EDataFlow flow, UINT64 *key)
++{
++    const char *default_device = flow == eCapture ? "aaudio:default:capture" : "aaudio:default:render";
++    const char *prefix = flow == eCapture ? "aaudio:device:capture:" : "aaudio:device:render:";
++    UINT64 value = 0;
++    unsigned int i;
++
++    if (!device || !strcmp(device, default_device))
++    {
++        *key = 0;
++        return TRUE;
++    }
++    if (strncmp(device, prefix, strlen(prefix))) return FALSE;
++    device += strlen(prefix);
++    for (i = 0; i < 16; ++i)
++    {
++        int digit = hex_value(device[i]);
++        if (digit < 0) return FALSE;
++        value = (value << 4) | digit;
++    }
++    if (device[16]) return FALSE;
++    *key = value;
++    return value != 0;
++}
++
++static int32_t resolve_device_id(UINT64 key, EDataFlow flow, BOOL *found)
++{
++    struct android_audio_device_snapshot snapshot;
++    UINT32 flag = device_flow_flag(flow);
++    UINT32 i;
++
++    *found = FALSE;
++    if (!key || !read_audio_device_snapshot(&snapshot)) return AAUDIO_UNSPECIFIED;
++    for (i = 0; i < snapshot.count; ++i)
++    {
++        if (snapshot.devices[i].stable_id == key && (snapshot.devices[i].flags & flag))
++        {
++            *found = TRUE;
++            return snapshot.devices[i].device_id;
++        }
++    }
++    return AAUDIO_UNSPECIFIED;
++}
++
++static UINT device_name_length(const WCHAR *name)
++{
++    UINT length = 0;
++    while (length + 1 < AUDIO_DEVICE_NAME_UNITS && name[length]) ++length;
++    return length;
++}
++
++static void format_endpoint_device(char *buffer, SIZE_T size, EDataFlow flow, UINT64 key)
++{
++    snprintf(buffer, size, "aaudio:device:%s:%016llx",
++             flow == eCapture ? "capture" : "render", (unsigned long long)key);
++}
++
++static HRESULT check_requested_device(AAudioStream *native, UINT64 key, int32_t requested, BOOL found)
++{
++    INT32 actual;
++
++    if (!key) return S_OK;
++    if (!found) return AUDCLNT_E_DEVICE_INVALIDATED;
++    actual = AAudioStream_getDeviceId(native);
++    if (actual == requested) return S_OK;
++    WARN("AAudio route mismatch key=%016llx requested=%d actual=%d\n",
++         (unsigned long long)key, requested, actual);
++    return AUDCLNT_E_DEVICE_INVALIDATED;
++}
++
++static void configure_builder(AAudioStreamBuilder *builder, EDataFlow flow,
++                              UINT32 rate, UINT32 channels, BOOL is_float, INT32 device_id)
++{
++    AAudioStreamBuilder_setDirection(builder, flow == eRender ? AAUDIO_DIRECTION_OUTPUT : AAUDIO_DIRECTION_INPUT);
++    AAudioStreamBuilder_setSampleRate(builder, rate);
++    AAudioStreamBuilder_setChannelCount(builder, channels);
++    AAudioStreamBuilder_setFormat(builder, is_float ? AAUDIO_FORMAT_PCM_FLOAT : AAUDIO_FORMAT_PCM_I16);
++    AAudioStreamBuilder_setSharingMode(builder, AAUDIO_SHARING_MODE_SHARED);
++    AAudioStreamBuilder_setPerformanceMode(builder, AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
++    if (flow == eRender)
++    {
++        void (*set_usage)(AAudioStreamBuilder *, aaudio_usage_t) =
++            (void (*)(AAudioStreamBuilder *, aaudio_usage_t))dlsym(RTLD_DEFAULT, "AAudioStreamBuilder_setUsage");
++        if (set_usage) set_usage(builder, AAUDIO_USAGE_GAME);
++    }
++    if (device_id != AAUDIO_UNSPECIFIED) AAudioStreamBuilder_setDeviceId(builder, device_id);
++}
++
++static HRESULT check_native_format(AAudioStream *native, UINT32 rate, UINT32 channels, BOOL is_float)
++{
++    if ((UINT32)AAudioStream_getSampleRate(native) != rate ||
++        (UINT32)AAudioStream_getChannelCount(native) != channels ||
++        AAudioStream_getFormat(native) != (is_float ? AAUDIO_FORMAT_PCM_FLOAT : AAUDIO_FORMAT_PCM_I16))
++        return AUDCLNT_E_UNSUPPORTED_FORMAT;
++    return S_OK;
++}
++
++static HRESULT aaudio_open_error(aaudio_result_t result)
++{
++    switch (result)
++    {
++    case AAUDIO_ERROR_INVALID_FORMAT:
++    case AAUDIO_ERROR_INVALID_RATE:
++        return AUDCLNT_E_UNSUPPORTED_FORMAT;
++    case AAUDIO_ERROR_DISCONNECTED:
++        return AUDCLNT_E_DEVICE_INVALIDATED;
++    case AAUDIO_ERROR_NO_MEMORY:
++        return E_OUTOFMEMORY;
++    default:
++        return E_FAIL;
++    }
++}
++
++static HRESULT probe_native_format(const char *device, EDataFlow flow, const WAVEFORMATEX *fmt)
++{
++    AAudioStreamBuilder *builder = NULL;
++    AAudioStream *native = NULL;
++    aaudio_result_t result;
++    UINT32 rate, channels, frame_size;
++    UINT64 device_key;
++    int32_t device_id;
++    BOOL is_float, found;
++    HRESULT hr;
++
++    if (!get_format(fmt, &rate, &channels, &frame_size, &is_float))
++        return AUDCLNT_E_UNSUPPORTED_FORMAT;
++    if (!parse_device_key(device, flow, &device_key))
++        return AUDCLNT_E_DEVICE_INVALIDATED;
++
++    pthread_mutex_lock(&aaudio_lifecycle_mutex);
++    device_id = resolve_device_id(device_key, flow, &found);
++    if (device_key && !found)
++    {
++        hr = AUDCLNT_E_DEVICE_INVALIDATED;
++        goto done;
++    }
++
++    result = AAudio_createStreamBuilder(&builder);
++    if (result != AAUDIO_OK || !builder)
++    {
++        hr = aaudio_open_error(result);
++        goto done;
++    }
++    configure_builder(builder, flow, rate, channels, is_float, device_id);
++    result = AAudioStreamBuilder_openStream(builder, &native);
++    if (result != AAUDIO_OK || !native)
++    {
++        hr = aaudio_open_error(result);
++        goto done;
++    }
++    hr = check_requested_device(native, device_key, device_id, found);
++    if (SUCCEEDED(hr)) hr = check_native_format(native, rate, channels, is_float);
++    if (SUCCEEDED(hr) && AAudioStream_getState(native) == AAUDIO_STREAM_STATE_DISCONNECTED)
++        hr = AUDCLNT_E_DEVICE_INVALIDATED;
++
++done:
++    if (native) AAudioStream_close(native);
++    if (builder) AAudioStreamBuilder_delete(builder);
++    pthread_mutex_unlock(&aaudio_lifecycle_mutex);
++    return hr;
++}
++
++static aaudio_result_t wait_for_state(AAudioStream *native, aaudio_stream_state_t transient,
++                                      aaudio_stream_state_t target)
++{
++    aaudio_stream_state_t state = AAudioStream_getState(native), next = state;
++    aaudio_result_t result;
++
++    if (state == target) return AAUDIO_OK;
++    if (state == AAUDIO_STREAM_STATE_DISCONNECTED) return AAUDIO_ERROR_DISCONNECTED;
++    if (state != transient) return AAUDIO_ERROR_INVALID_STATE;
++
++    result = AAudioStream_waitForStateChange(native, transient, &next, STATE_WAIT_NS);
++    if (result != AAUDIO_OK) return result;
++    if (next == target) return AAUDIO_OK;
++    if (next == AAUDIO_STREAM_STATE_DISCONNECTED) return AAUDIO_ERROR_DISCONNECTED;
++    return AAUDIO_ERROR_INVALID_STATE;
++}
++
++static aaudio_data_callback_result_t aaudio_data_callback(AAudioStream *native, void *userdata,
++                                                          void *audio_data, int32_t num_frames)
++{
++    struct aaudio_stream *stream = userdata;
++    UINT32 native_frames = num_frames > 0 ? (UINT32)num_frames : 0;
++    UINT32 frames = native_frames, take;
++    LONGLONG device_after;
++    UINT64 callback_frame_position;
++
++    if (!frames) return AAUDIO_CALLBACK_RESULT_CONTINUE;
++    device_after = InterlockedAdd64(&stream->device_frames, native_frames);
++    callback_frame_position = (UINT64)(device_after - native_frames);
++
++    if (stream->flow == eRender)
++    {
++        UINT64 read_frames, write_frames, available;
++
++        if (!__atomic_load_n(&stream->started, __ATOMIC_ACQUIRE) || stream_disconnected(stream))
++        {
++            memset(audio_data, 0, (SIZE_T)frames * stream->frame_size);
++            audio_capture_write(stream, audio_data, frames, callback_frame_position);
++            return AAUDIO_CALLBACK_RESULT_CONTINUE;
++        }
++
++        read_frames = __atomic_load_n(&stream->render_read_frames, __ATOMIC_RELAXED);
++        write_frames = __atomic_load_n(&stream->render_write_frames, __ATOMIC_ACQUIRE);
++        available = write_frames - read_frames;
++        take = (UINT32)min((UINT64)frames, available);
++        if (take) copy_render_ring_out(stream, audio_data, read_frames, take);
++        if (take < frames)
++        {
++            memset((BYTE *)audio_data + (SIZE_T)take * stream->frame_size, 0,
++                   (SIZE_T)(frames - take) * stream->frame_size);
++            InterlockedAdd64(&stream->render_underrun_frames, frames - take);
++        }
++        if (take)
++        {
++            apply_volume(stream, audio_data, take);
++            __atomic_store_n(&stream->render_read_frames, read_frames + take, __ATOMIC_RELEASE);
++        }
++        audio_capture_write(stream, audio_data, native_frames, callback_frame_position);
++    }
++    else
++    {
++        if (!__atomic_load_n(&stream->started, __ATOMIC_ACQUIRE) || stream_disconnected(stream))
++            return AAUDIO_CALLBACK_RESULT_CONTINUE;
++        write_capture_ring(stream, audio_data, native_frames);
++    }
++
++    if (stream->flags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK)
++    {
++        UINT32 previous, next;
++        do
++        {
++            previous = __atomic_load_n(&stream->event_frames, __ATOMIC_RELAXED);
++            next = (UINT32)(((UINT64)previous + native_frames) % stream->period_frames);
++        } while (!__atomic_compare_exchange_n(&stream->event_frames, &previous, next, FALSE,
++                                              __ATOMIC_ACQ_REL, __ATOMIC_RELAXED));
++        if ((UINT64)previous + native_frames >= stream->period_frames)
++            signal_audio_event(stream);
++    }
++    return AAUDIO_CALLBACK_RESULT_CONTINUE;
++}
++
++static void aaudio_error_callback(AAudioStream *native, void *userdata, aaudio_result_t error)
++{
++    struct aaudio_stream *stream = userdata;
++
++    if (native != __atomic_load_n(&stream->native, __ATOMIC_ACQUIRE)) return;
++    InterlockedExchange(&stream->last_native_error, error);
++    InterlockedExchange(&stream->disconnected, TRUE);
++    if (stream->capture_slot)
++        android_audio_atomic_store_u32(&stream->capture_slot->producer_active, 0);
++    signal_audio_event(stream);
++}
++
++static aaudio_result_t close_native_stream_locked(struct aaudio_stream *stream)
++{
++    AAudioStream *native = __atomic_exchange_n(&stream->native, NULL, __ATOMIC_ACQ_REL);
++    aaudio_result_t result;
++
++    InterlockedExchange(&stream->disconnected, TRUE);
++    if (!native) return AAUDIO_OK;
++    if (AAudioStream_getState(native) == AAUDIO_STREAM_STATE_STARTING ||
++        AAudioStream_getState(native) == AAUDIO_STREAM_STATE_STARTED ||
++        AAudioStream_getState(native) == AAUDIO_STREAM_STATE_STOPPING ||
++        AAudioStream_getState(native) == AAUDIO_STREAM_STATE_DISCONNECTED)
++        AAudioStream_requestStop(native);
++    result = AAudioStream_close(native);
++    if (result != AAUDIO_OK)
++        ERR("AAudio close failed stream=%p result=%d (%s)\n",
++            stream, result, AAudio_convertResultToText(result));
++    return result;
++}
++
++static HRESULT open_native_stream_locked(struct aaudio_stream *stream)
++{
++    AAudioStreamBuilder *builder = NULL;
++    aaudio_result_t result;
++    AAudioStream *native = NULL;
++    BOOL is_float, found;
++    int32_t device_id;
++    UINT32 rate, channels, frame_size;
++    HRESULT hr;
++
++    if (!get_format(&stream->fmt.Format, &rate, &channels, &frame_size, &is_float))
++        return AUDCLNT_E_UNSUPPORTED_FORMAT;
++
++    device_id = resolve_device_id(stream->device_key, stream->flow, &found);
++    if (stream->device_key && !found)
++    {
++        InterlockedExchange(&stream->endpoint_invalidated, TRUE);
++        return AUDCLNT_E_DEVICE_INVALIDATED;
++    }
++
++    result = AAudio_createStreamBuilder(&builder);
++    if (result != AAUDIO_OK || !builder)
++    {
++        ERR("AAudio create builder failed stream=%p result=%d (%s)\n",
++             stream, result, AAudio_convertResultToText(result));
++        if (builder) AAudioStreamBuilder_delete(builder);
++        return aaudio_open_error(result);
++    }
++
++    configure_builder(builder, stream->flow, rate, channels, is_float, device_id);
++    AAudioStreamBuilder_setDataCallback(builder, aaudio_data_callback, stream);
++    AAudioStreamBuilder_setErrorCallback(builder, aaudio_error_callback, stream);
++    result = AAudioStreamBuilder_openStream(builder, &native);
++    AAudioStreamBuilder_delete(builder);
++    if (result != AAUDIO_OK || !native)
++    {
++        ERR("AAudio open stream failed stream=%p result=%d (%s) native=%p\n",
++             stream, result, AAudio_convertResultToText(result), native);
++        if (native) AAudioStream_close(native);
++        return aaudio_open_error(result);
++    }
++
++    hr = check_requested_device(native, stream->device_key, device_id, found);
++    if (SUCCEEDED(hr)) hr = check_native_format(native, rate, channels, is_float);
++    if (SUCCEEDED(hr) && AAudioStream_getState(native) == AAUDIO_STREAM_STATE_DISCONNECTED)
++        hr = AUDCLNT_E_DEVICE_INVALIDATED;
++    if (FAILED(hr))
++    {
++        if (hr == AUDCLNT_E_DEVICE_INVALIDATED)
++            InterlockedExchange(&stream->endpoint_invalidated, TRUE);
++        AAudioStream_close(native);
++        return hr;
++    }
++    __atomic_store_n(&stream->native, native, __ATOMIC_RELEASE);
++    InterlockedExchange(&stream->endpoint_invalidated, FALSE);
++    if (stream->device_key && found)
++        TRACE("AAudio route key=%016llx device=%d\n",
++              (unsigned long long)stream->device_key, device_id);
++    return S_OK;
++}
++
++static HRESULT open_native_stream(struct aaudio_stream *stream)
++{
++    HRESULT hr;
++
++    pthread_mutex_lock(&aaudio_lifecycle_mutex);
++    hr = open_native_stream_locked(stream);
++    pthread_mutex_unlock(&aaudio_lifecycle_mutex);
++    return hr;
++}
++
++static NTSTATUS aaudio_process_attach(void *args)
++{
++    const char *path = getenv("WINE_ANDROID_AUDIO_DEVICES_SHM");
++
++    map_audio_capture();
++
++#ifdef _WIN64
++    if (NtCurrentTeb()->WowTebOffset)
++    {
++        SYSTEM_BASIC_INFORMATION info;
++        if (!NtQuerySystemInformation(SystemEmulationBasicInformation, &info, sizeof(info), NULL))
++            zero_bits = (ULONG_PTR)info.HighestUserAddress | 0x7fffffff;
++    }
++#endif
++
++    if (path && path[0])
++    {
++        struct stat statbuf;
++        void *mapped;
++
++        audio_devices_fd = open(path, O_RDONLY | O_CLOEXEC);
++        if (audio_devices_fd < 0)
++        {
++            WARN("could not open audio device table %s: %d\n", path, errno);
++            return STATUS_SUCCESS;
++        }
++        if (fstat(audio_devices_fd, &statbuf) || statbuf.st_size < sizeof(*audio_devices))
++        {
++            WARN("invalid audio device table %s\n", path);
++            close(audio_devices_fd);
++            audio_devices_fd = -1;
++            return STATUS_SUCCESS;
++        }
++        mapped = mmap(NULL, sizeof(*audio_devices), PROT_READ, MAP_SHARED, audio_devices_fd, 0);
++        if (mapped == MAP_FAILED)
++        {
++            WARN("could not map audio device table %s: %d\n", path, errno);
++            close(audio_devices_fd);
++            audio_devices_fd = -1;
++            return STATUS_SUCCESS;
++        }
++        audio_devices = mapped;
++        if (audio_devices->magic != AUDIO_DEVICE_MAGIC || audio_devices->version != AUDIO_DEVICE_VERSION)
++        {
++            WARN("unsupported audio device table %s\n", path);
++            munmap((void *)audio_devices, sizeof(*audio_devices));
++            audio_devices = NULL;
++            close(audio_devices_fd);
++            audio_devices_fd = -1;
++        }
++    }
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS aaudio_process_detach(void *args)
++{
++    if (audio_devices)
++    {
++        munmap((void *)audio_devices, sizeof(*audio_devices));
++        audio_devices = NULL;
++    }
++    if (audio_devices_fd >= 0)
++    {
++        close(audio_devices_fd);
++        audio_devices_fd = -1;
++    }
++    if (audio_capture)
++    {
++        munmap(audio_capture, sizeof(*audio_capture));
++        audio_capture = NULL;
++    }
++    if (audio_capture_fd >= 0)
++    {
++        close(audio_capture_fd);
++        audio_capture_fd = -1;
++    }
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS aaudio_main_loop(void *args)
++{
++    struct main_loop_params *params = args;
++    NtSetEvent(params->event, NULL);
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS aaudio_get_endpoint_ids(void *args)
++{
++    struct get_endpoint_ids_params *params = args;
++    static const WCHAR render_default_name[] = {'S','y','s','t','e','m',' ','D','e','f','a','u','l','t',' ','O','u','t','p','u','t',0};
++    static const WCHAR capture_default_name[] = {'S','y','s','t','e','m',' ','D','e','f','a','u','l','t',' ','I','n','p','u','t',0};
++    static const WCHAR fallback_name[] = {'A','n','d','r','o','i','d',' ','A','u','d','i','o',' ','D','e','v','i','c','e',0};
++    static const char render_default_device[] = "aaudio:default:render";
++    static const char capture_default_device[] = "aaudio:default:capture";
++    struct android_audio_device_snapshot snapshot;
++    const WCHAR *default_name = params->flow == eCapture ? capture_default_name : render_default_name;
++    const char *default_device = params->flow == eCapture ? capture_default_device : render_default_device;
++    UINT32 flag = device_flow_flag(params->flow);
++    UINT32 count = 1, needed, offset, i, index;
++    struct endpoint *endpoints;
++    char device[64];
++
++    if (read_audio_device_snapshot(&snapshot))
++    {
++        for (i = 0; i < snapshot.count; ++i)
++            if (snapshot.devices[i].flags & flag) ++count;
++    }
++    else snapshot.count = 0;
++
++    needed = count * sizeof(struct endpoint);
++    needed += (lstrlenW(default_name) + 1) * sizeof(WCHAR);
++    needed += (strlen(default_device) + 2) & ~1;
++    for (i = 0; i < snapshot.count; ++i)
++    {
++        UINT name_len;
++        if (!(snapshot.devices[i].flags & flag)) continue;
++        name_len = device_name_length(snapshot.devices[i].name);
++        if (!name_len) name_len = lstrlenW(fallback_name);
++        needed += (name_len + 1) * sizeof(WCHAR);
++        format_endpoint_device(device, sizeof(device), params->flow, snapshot.devices[i].stable_id);
++        needed += (strlen(device) + 2) & ~1;
++    }
++
++    params->num = count;
++    params->default_idx = 0;
++    if (params->size < needed)
++    {
++        params->size = needed;
++        params->result = HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
++        return STATUS_SUCCESS;
++    }
++
++    endpoints = params->endpoints;
++    offset = count * sizeof(*endpoints);
++
++    endpoints[0].name = offset;
++    memcpy((BYTE *)endpoints + offset, default_name,
++           (lstrlenW(default_name) + 1) * sizeof(WCHAR));
++    offset += (lstrlenW(default_name) + 1) * sizeof(WCHAR);
++    endpoints[0].device = offset;
++    memcpy((BYTE *)endpoints + offset, default_device, strlen(default_device) + 1);
++    offset += (strlen(default_device) + 2) & ~1;
++
++    index = 1;
++    for (i = 0; i < snapshot.count; ++i)
++    {
++        const WCHAR *name;
++        UINT name_len;
++        if (!(snapshot.devices[i].flags & flag)) continue;
++
++        name_len = device_name_length(snapshot.devices[i].name);
++        name = name_len ? snapshot.devices[i].name : fallback_name;
++        if (!name_len) name_len = lstrlenW(fallback_name);
++
++        endpoints[index].name = offset;
++        memcpy((BYTE *)endpoints + offset, name, name_len * sizeof(WCHAR));
++        memset((BYTE *)endpoints + offset + name_len * sizeof(WCHAR), 0, sizeof(WCHAR));
++        offset += (name_len + 1) * sizeof(WCHAR);
++
++        format_endpoint_device(device, sizeof(device), params->flow, snapshot.devices[i].stable_id);
++        endpoints[index].device = offset;
++        memcpy((BYTE *)endpoints + offset, device, strlen(device) + 1);
++        offset += (strlen(device) + 2) & ~1;
++        ++index;
++    }
++
++    params->result = S_OK;
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS aaudio_create_stream(void *args)
++{
++    struct create_stream_params *params = args;
++    struct aaudio_stream *stream;
++    UINT32 requested_frames, minimum_frames;
++    UINT64 device_key;
++    SIZE_T bytes;
++    unsigned int i;
++    BOOL is_float;
++    HRESULT hr;
++
++    params->result = E_FAIL;
++    if (!parse_device_key(params->device, params->flow, &device_key))
++    {
++        params->result = AUDCLNT_E_DEVICE_INVALIDATED;
++        return STATUS_SUCCESS;
++    }
++    if (params->share == AUDCLNT_SHAREMODE_EXCLUSIVE)
++    {
++        params->result = AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED;
++        return STATUS_SUCCESS;
++    }
++
++    if (!(stream = calloc(1, sizeof(*stream))))
++    {
++        params->result = E_OUTOFMEMORY;
++        return STATUS_SUCCESS;
++    }
++    pthread_mutex_init(&stream->mutex, NULL);
++    if (sem_init(&stream->event_sem, 0, 0))
++    {
++        pthread_mutex_destroy(&stream->mutex);
++        free(stream);
++        params->result = E_FAIL;
++        return STATUS_SUCCESS;
++    }
++    stream->flow = params->flow;
++    stream->device_key = device_key;
++    stream->share = params->share;
++    stream->flags = params->flags;
++    if (!get_format(params->fmt, &stream->rate, &stream->channels, &stream->frame_size, &is_float))
++    {
++        params->result = AUDCLNT_E_UNSUPPORTED_FORMAT;
++        goto fail;
++    }
++    stream->is_float = is_float;
++    memset(&stream->fmt, 0, sizeof(stream->fmt));
++    memcpy(&stream->fmt, params->fmt,
++           min((SIZE_T)sizeof(stream->fmt), (SIZE_T)sizeof(WAVEFORMATEX) + params->fmt->cbSize));
++    for (i = 0; i < stream->channels; ++i) stream->volumes[i] = 1.0f;
++
++    requested_frames = frames_from_100ns(params->duration, stream->rate);
++    if (!requested_frames) requested_frames = stream->rate / 10;
++    stream->period_frames = frames_from_100ns(params->period, stream->rate);
++    if (!stream->period_frames) stream->period_frames = frames_from_100ns(DEFAULT_PERIOD_100NS, stream->rate);
++    if (!stream->period_frames) stream->period_frames = 1;
++    minimum_frames = stream->period_frames > UINT32_MAX / 2 ? UINT32_MAX : stream->period_frames * 2;
++    stream->buffer_frames = max(requested_frames, minimum_frames);
++    if ((SIZE_T)stream->buffer_frames > ~(SIZE_T)0 / stream->frame_size)
++    {
++        params->result = E_OUTOFMEMORY;
++        goto fail;
++    }
++    bytes = (SIZE_T)stream->buffer_frames * stream->frame_size;
++    if (!(stream->buffer = low_alloc(bytes)))
++    {
++        params->result = E_OUTOFMEMORY;
++        goto fail;
++    }
++    memset(stream->buffer, 0, bytes);
++
++    hr = open_native_stream(stream);
++    if (FAILED(hr))
++    {
++        params->result = hr;
++        goto fail;
++    }
++
++    audio_capture_claim_stream(stream);
++    *params->channel_count = stream->channels;
++    *params->stream = (stream_handle)(ULONG_PTR)stream;
++    params->result = S_OK;
++    return STATUS_SUCCESS;
++
++fail:
++    audio_capture_release_stream(stream);
++    if (stream->native)
++    {
++        pthread_mutex_lock(&aaudio_lifecycle_mutex);
++        close_native_stream_locked(stream);
++        pthread_mutex_unlock(&aaudio_lifecycle_mutex);
++    }
++    low_free(stream->buffer);
++    low_free(stream->tmp_buffer);
++    sem_destroy(&stream->event_sem);
++    pthread_mutex_destroy(&stream->mutex);
++    free(stream);
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS aaudio_release_stream(void *args)
++{
++    struct release_stream_params *params = args;
++    struct aaudio_stream *stream = stream_from_handle(params->stream);
++    aaudio_stream_state_t state;
++    aaudio_result_t result;
++
++    if (!stream)
++    {
++        params->result = E_INVALIDARG;
++        return STATUS_SUCCESS;
++    }
++
++    pthread_mutex_lock(&stream->mutex);
++    __atomic_store_n(&stream->quitting, TRUE, __ATOMIC_RELEASE);
++    if (stream->capture_slot)
++        android_audio_atomic_store_u32(&stream->capture_slot->producer_active, 0);
++    sem_post(&stream->event_sem);
++    pthread_mutex_unlock(&stream->mutex);
++
++    if (params->timer_thread)
++    {
++        NtWaitForSingleObject(params->timer_thread, FALSE, NULL);
++        NtClose(params->timer_thread);
++    }
++
++    if (stream->native)
++    {
++        pthread_mutex_lock(&aaudio_lifecycle_mutex);
++
++        state = AAudioStream_getState(stream->native);
++        if (state == AAUDIO_STREAM_STATE_STARTING ||
++            state == AAUDIO_STREAM_STATE_STARTED ||
++            stream->started)
++        {
++            result = AAudioStream_requestStop(stream->native);
++            if (result == AAUDIO_OK)
++                result = wait_for_state(stream->native,
++                                        AAUDIO_STREAM_STATE_STOPPING,
++                                        AAUDIO_STREAM_STATE_STOPPED);
++
++            if (result != AAUDIO_OK && result != AAUDIO_ERROR_DISCONNECTED)
++                WARN("AAudio release stop failed stream=%p native=%p result=%d (%s)\n",
++                     stream, stream->native, result, AAudio_convertResultToText(result));
++        }
++
++        close_native_stream_locked(stream);
++        pthread_mutex_unlock(&aaudio_lifecycle_mutex);
++    }
++
++    TRACE("AAudio stream=%p flow=%d underrun_frames=%lld capture_dropped_frames=%lld\n",
++          stream, stream->flow,
++          (long long)InterlockedCompareExchange64(&stream->render_underrun_frames, 0, 0),
++          (long long)InterlockedCompareExchange64(&stream->capture_lost_frames, 0, 0));
++    audio_capture_release_stream(stream);
++    low_free(stream->buffer);
++    low_free(stream->tmp_buffer);
++    sem_destroy(&stream->event_sem);
++    pthread_mutex_destroy(&stream->mutex);
++    free(stream);
++    params->result = S_OK;
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS aaudio_start(void *args)
++{
++    struct start_params *params = args;
++    struct aaudio_stream *stream = stream_from_handle(params->stream);
++    aaudio_result_t result;
++    unsigned int start_attempt = 0;
++
++    if (!stream) { params->result = AUDCLNT_E_DEVICE_INVALIDATED; return STATUS_SUCCESS; }
++    pthread_mutex_lock(&stream->mutex);
++    pthread_mutex_lock(&aaudio_lifecycle_mutex);
++
++    if (stream->started)
++    {
++        params->result = AUDCLNT_E_NOT_STOPPED;
++        goto lifecycle_done;
++    }
++    if ((stream->flags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK) && !stream->event)
++    {
++        params->result = AUDCLNT_E_EVENTHANDLE_NOT_SET;
++        goto lifecycle_done;
++    }
++
++    if (stream_disconnected(stream))
++    {
++        if (stream->native && close_native_stream_locked(stream) != AAUDIO_OK)
++        {
++            params->result = AUDCLNT_E_DEVICE_INVALIDATED;
++            goto lifecycle_done;
++        }
++        __atomic_store_n(&stream->started, FALSE, __ATOMIC_RELEASE);
++        params->result = open_native_stream_locked(stream);
++        if (FAILED(params->result)) goto lifecycle_done;
++        InterlockedExchange(&stream->disconnected, FALSE);
++    }
++
++    if (!stream->native)
++    {
++        params->result = AUDCLNT_E_DEVICE_INVALIDATED;
++        goto lifecycle_done;
++    }
++
++retry_start:
++    audio_clock_begin_start(stream);
++    result = AAudioStream_requestStart(stream->native);
++    if (result == AAUDIO_OK)
++        result = wait_for_state(stream->native, AAUDIO_STREAM_STATE_STARTING, AAUDIO_STREAM_STATE_STARTED);
++    if (result != AAUDIO_OK)
++    {
++        if (result == AAUDIO_ERROR_DISCONNECTED && !start_attempt)
++        {
++            if (close_native_stream_locked(stream) != AAUDIO_OK)
++            {
++                params->result = AUDCLNT_E_DEVICE_INVALIDATED;
++                goto lifecycle_done;
++            }
++            __atomic_store_n(&stream->started, FALSE, __ATOMIC_RELEASE);
++
++            params->result = open_native_stream_locked(stream);
++            if (FAILED(params->result)) goto lifecycle_done;
++
++            InterlockedExchange(&stream->disconnected, FALSE);
++            ++start_attempt;
++            goto retry_start;
++        }
++
++        ERR("AAudio Start failed stream=%p native=%p result=%d (%s) state=%d (%s)\n",
++            stream, stream->native, result, AAudio_convertResultToText(result),
++            AAudioStream_getState(stream->native),
++            AAudio_convertStreamStateToText(AAudioStream_getState(stream->native)));
++
++        if (result == AAUDIO_ERROR_DISCONNECTED)
++            InterlockedExchange(&stream->disconnected, TRUE);
++        params->result = result == AAUDIO_ERROR_DISCONNECTED ? AUDCLNT_E_DEVICE_INVALIDATED : E_FAIL;
++        goto lifecycle_done;
++    }
++
++    __atomic_store_n(&stream->event_frames, 0, __ATOMIC_RELEASE);
++    stream->reset_complete = FALSE;
++    __atomic_store_n(&stream->started, TRUE, __ATOMIC_RELEASE);
++    if (stream->capture_slot)
++        android_audio_atomic_store_u32(&stream->capture_slot->producer_active, 1);
++    params->result = S_OK;
++
++lifecycle_done:
++    pthread_mutex_unlock(&aaudio_lifecycle_mutex);
++    pthread_mutex_unlock(&stream->mutex);
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS aaudio_stop(void *args)
++{
++    struct stop_params *params = args;
++    struct aaudio_stream *stream = stream_from_handle(params->stream);
++    aaudio_result_t result = AAUDIO_OK, close_result;
++    aaudio_stream_state_t state = AAUDIO_STREAM_STATE_UNINITIALIZED;
++    BOOL found = FALSE;
++
++    if (!stream) { params->result = AUDCLNT_E_DEVICE_INVALIDATED; return STATUS_SUCCESS; }
++    pthread_mutex_lock(&stream->mutex);
++    if (!__atomic_load_n(&stream->started, __ATOMIC_ACQUIRE))
++    {
++        params->result = S_FALSE;
++        goto done;
++    }
++
++    pthread_mutex_lock(&aaudio_lifecycle_mutex);
++    audio_clock_update(stream);
++    if (stream->native && !stream_disconnected(stream))
++    {
++        result = AAudioStream_requestStop(stream->native);
++        if (result == AAUDIO_OK)
++            result = wait_for_state(stream->native, AAUDIO_STREAM_STATE_STOPPING,
++                                    AAUDIO_STREAM_STATE_STOPPED);
++        state = AAudioStream_getState(stream->native);
++        if (state == AAUDIO_STREAM_STATE_STOPPED && !stream_disconnected(stream))
++            result = AAUDIO_OK;
++    }
++    else result = AAUDIO_ERROR_DISCONNECTED;
++
++    if (result != AAUDIO_OK || stream_disconnected(stream))
++    {
++        if (stream->native)
++            state = AAudioStream_getState(stream->native);
++        WARN("AAudio Stop retiring stream=%p native=%p result=%d (%s) state=%d (%s) callback_error=%d\n",
++             stream, stream->native, result, AAudio_convertResultToText(result),
++             state, AAudio_convertStreamStateToText(state),
++             (int)InterlockedCompareExchange(&stream->last_native_error, 0, 0));
++        close_result = close_native_stream_locked(stream);
++        if (stream->device_key)
++            resolve_device_id(stream->device_key, stream->flow, &found);
++        if (stream->device_key && !found)
++            InterlockedExchange(&stream->endpoint_invalidated, TRUE);
++        if (close_result != AAUDIO_OK || (stream->device_key && !found))
++            params->result = close_result == AAUDIO_ERROR_DISCONNECTED || (stream->device_key && !found)
++                             ? AUDCLNT_E_DEVICE_INVALIDATED : E_FAIL;
++        else
++            params->result = S_OK;
++    }
++    else params->result = S_OK;
++    pthread_mutex_unlock(&aaudio_lifecycle_mutex);
++
++    __atomic_store_n(&stream->started, FALSE, __ATOMIC_RELEASE);
++    if (stream->capture_slot)
++        android_audio_atomic_store_u32(&stream->capture_slot->producer_active, 0);
++
++done:
++    pthread_mutex_unlock(&stream->mutex);
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS aaudio_reset(void *args)
++{
++    struct reset_params *params = args;
++    struct aaudio_stream *stream = stream_from_handle(params->stream);
++    aaudio_result_t result = AAUDIO_OK;
++
++    if (!stream) { params->result = AUDCLNT_E_DEVICE_INVALIDATED; return STATUS_SUCCESS; }
++    pthread_mutex_lock(&stream->mutex);
++    if (__atomic_load_n(&stream->started, __ATOMIC_ACQUIRE))
++    {
++        params->result = AUDCLNT_E_NOT_STOPPED;
++        goto done;
++    }
++    if (stream->locked_data)
++    {
++        params->result = AUDCLNT_E_BUFFER_OPERATION_PENDING;
++        goto done;
++    }
++    if (stream_endpoint_invalidated(stream))
++    {
++        params->result = AUDCLNT_E_DEVICE_INVALIDATED;
++        goto done;
++    }
++    if (stream->reset_complete)
++    {
++        params->result = S_FALSE;
++        goto done;
++    }
++
++    if (stream->native && stream->flow == eRender)
++    {
++        pthread_mutex_lock(&aaudio_lifecycle_mutex);
++        if (stream_disconnected(stream))
++        {
++            result = close_native_stream_locked(stream);
++        }
++        else
++        {
++            result = AAudioStream_requestFlush(stream->native);
++            if (result == AAUDIO_OK)
++                result = wait_for_state(stream->native, AAUDIO_STREAM_STATE_FLUSHING,
++                                        AAUDIO_STREAM_STATE_FLUSHED);
++            if (result != AAUDIO_OK)
++            {
++                aaudio_stream_state_t state = AAudioStream_getState(stream->native);
++                if (state == AAUDIO_STREAM_STATE_FLUSHED && !stream_disconnected(stream))
++                    result = AAUDIO_OK;
++                else
++                {
++                    WARN("AAudio Reset retiring stream=%p result=%d (%s) state=%d (%s) callback_error=%d\n",
++                         stream, result, AAudio_convertResultToText(result),
++                         state, AAudio_convertStreamStateToText(state),
++                         (int)InterlockedCompareExchange(&stream->last_native_error, 0, 0));
++                    result = close_native_stream_locked(stream);
++                }
++            }
++        }
++        pthread_mutex_unlock(&aaudio_lifecycle_mutex);
++        if (result != AAUDIO_OK)
++        {
++            params->result = result == AAUDIO_ERROR_DISCONNECTED ? AUDCLNT_E_DEVICE_INVALIDATED : E_FAIL;
++            goto done;
++        }
++    }
++
++    __atomic_store_n(&stream->render_read_frames, 0, __ATOMIC_RELEASE);
++    __atomic_store_n(&stream->render_write_frames, 0, __ATOMIC_RELEASE);
++    __atomic_store_n(&stream->capture_read_frames, 0, __ATOMIC_RELEASE);
++    __atomic_store_n(&stream->capture_write_frames, 0, __ATOMIC_RELEASE);
++    stream->capture_reported_lost_frames = 0;
++    stream->locked_capture_lost_frames = 0;
++    stream->locked_data = NULL;
++    stream->locked_frames = 0;
++    stream->locked_tmp = FALSE;
++    stream->render_zero_pending = FALSE;
++    stream->reset_complete = TRUE;
++    atomic_store64(&stream->device_frames, 0);
++    stream->clock_position_frames = 0;
++    stream->clock_start_frames = 0;
++    stream->clock_native_start_frames = 0;
++    stream->clock_callback_start_frames = 0;
++    stream->clock_qpc_100ns = 0;
++    stream->clock_has_timestamp = FALSE;
++    atomic_store64(&stream->capture_lost_frames, 0);
++    atomic_store64(&stream->render_underrun_frames, 0);
++    __atomic_store_n(&stream->event_frames, 0, __ATOMIC_RELEASE);
++    params->result = S_OK;
++
++done:
++    pthread_mutex_unlock(&stream->mutex);
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS aaudio_timer_loop(void *args)
++{
++    struct timer_loop_params *params = args;
++    struct aaudio_stream *stream = stream_from_handle(params->stream);
++
++    if (!stream) return STATUS_SUCCESS;
++
++    for (;;)
++    {
++        HANDLE event;
++        int result;
++
++        do result = sem_wait(&stream->event_sem);
++        while (result == -1 && errno == EINTR);
++        if (result == -1 || __atomic_load_n(&stream->quitting, __ATOMIC_ACQUIRE)) break;
++        if (!InterlockedExchange(&stream->event_pending, FALSE)) continue;
++        pthread_mutex_lock(&stream->mutex);
++        event = stream->event;
++        pthread_mutex_unlock(&stream->mutex);
++        if (event) NtSetEvent(event, NULL);
++    }
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS aaudio_get_render_buffer(void *args)
++{
++    struct get_render_buffer_params *params = args;
++    struct aaudio_stream *stream = stream_from_handle(params->stream);
++    UINT32 free_frames, first, write_pos;
++    UINT64 read_frames, write_frames;
++    SIZE_T bytes;
++    if (!stream || stream->flow != eRender) { params->result = AUDCLNT_E_WRONG_ENDPOINT_TYPE; return STATUS_SUCCESS; }
++    pthread_mutex_lock(&stream->mutex);
++    if (stream_endpoint_invalidated(stream)) { params->result = AUDCLNT_E_DEVICE_INVALIDATED; goto done; }
++    if (stream->locked_data) { params->result = AUDCLNT_E_OUT_OF_ORDER; goto done; }
++    if (!params->frames)
++    {
++        stream->render_zero_pending = TRUE;
++        *params->data = NULL;
++        params->result = S_OK;
++        goto done;
++    }
++    read_frames = __atomic_load_n(&stream->render_read_frames, __ATOMIC_ACQUIRE);
++    write_frames = __atomic_load_n(&stream->render_write_frames, __ATOMIC_RELAXED);
++    free_frames = stream->buffer_frames - (UINT32)(write_frames - read_frames);
++    if (params->frames > free_frames) { params->result = AUDCLNT_E_BUFFER_TOO_LARGE; goto done; }
++    write_pos = (UINT32)(write_frames % stream->buffer_frames);
++    first = min(params->frames, stream->buffer_frames - write_pos);
++    if (first == params->frames)
++    {
++        stream->locked_data = stream->buffer + (SIZE_T)write_pos * stream->frame_size;
++        stream->locked_tmp = FALSE;
++    }
++    else
++    {
++        bytes = (SIZE_T)params->frames * stream->frame_size;
++        if (stream->tmp_frames < params->frames)
++        {
++            low_free(stream->tmp_buffer);
++            stream->tmp_buffer = low_alloc(bytes);
++            if (!stream->tmp_buffer) { stream->tmp_frames = 0; params->result = E_OUTOFMEMORY; goto done; }
++            stream->tmp_frames = params->frames;
++        }
++        stream->locked_data = stream->tmp_buffer;
++        stream->locked_tmp = TRUE;
++    }
++    stream->render_zero_pending = FALSE;
++    stream->locked_frames = params->frames;
++    memset(stream->locked_data, 0, (SIZE_T)params->frames * stream->frame_size);
++    *params->data = stream->locked_data;
++    params->result = S_OK;
++done:
++    pthread_mutex_unlock(&stream->mutex);
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS aaudio_release_render_buffer(void *args)
++{
++    struct release_render_buffer_params *params = args;
++    struct aaudio_stream *stream = stream_from_handle(params->stream);
++    UINT32 first, write_pos;
++    UINT64 write_frames;
++
++    if (!stream || stream->flow != eRender) { params->result = AUDCLNT_E_WRONG_ENDPOINT_TYPE; return STATUS_SUCCESS; }
++    pthread_mutex_lock(&stream->mutex);
++    if (stream_endpoint_invalidated(stream)) { params->result = AUDCLNT_E_DEVICE_INVALIDATED; goto done; }
++    if (!stream->locked_data && !stream->render_zero_pending)
++    {
++        params->result = AUDCLNT_E_OUT_OF_ORDER;
++        goto done;
++    }
++    if (params->flags & ~AUDCLNT_BUFFERFLAGS_SILENT)
++    {
++        params->result = E_INVALIDARG;
++        goto done;
++    }
++    if (params->written_frames > stream->locked_frames)
++    {
++        params->result = AUDCLNT_E_INVALID_SIZE;
++        goto done;
++    }
++    if (!params->written_frames)
++    {
++        stream->locked_data = NULL;
++        stream->locked_frames = 0;
++        stream->locked_tmp = FALSE;
++        stream->render_zero_pending = FALSE;
++        params->result = S_OK;
++        goto done;
++    }
++
++    if (params->flags & AUDCLNT_BUFFERFLAGS_SILENT)
++        memset(stream->locked_data, 0, (SIZE_T)params->written_frames * stream->frame_size);
++    write_frames = __atomic_load_n(&stream->render_write_frames, __ATOMIC_RELAXED);
++    write_pos = (UINT32)(write_frames % stream->buffer_frames);
++    if (stream->locked_tmp)
++    {
++        first = min(params->written_frames, stream->buffer_frames - write_pos);
++        memcpy(stream->buffer + (SIZE_T)write_pos * stream->frame_size, stream->locked_data,
++               (SIZE_T)first * stream->frame_size);
++        if (first < params->written_frames)
++            memcpy(stream->buffer, stream->locked_data + (SIZE_T)first * stream->frame_size,
++                   (SIZE_T)(params->written_frames - first) * stream->frame_size);
++    }
++    __atomic_store_n(&stream->render_write_frames, write_frames + params->written_frames, __ATOMIC_RELEASE);
++    stream->reset_complete = FALSE;
++    stream->locked_data = NULL;
++    stream->locked_frames = 0;
++    stream->locked_tmp = FALSE;
++    params->result = S_OK;
++
++done:
++    pthread_mutex_unlock(&stream->mutex);
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS aaudio_get_capture_buffer(void *args)
++{
++    struct get_capture_buffer_params *params = args;
++    struct aaudio_stream *stream = stream_from_handle(params->stream);
++    UINT64 read_frames, write_frames, lost_frames, captured_frames;
++    UINT32 frames, first, pos;
++    SIZE_T bytes;
++    LARGE_INTEGER counter, freq;
++
++    if (!stream || stream->flow != eCapture)
++    {
++        params->result = AUDCLNT_E_WRONG_ENDPOINT_TYPE;
++        return STATUS_SUCCESS;
++    }
++
++    pthread_mutex_lock(&stream->mutex);
++    if (stream_endpoint_invalidated(stream)) { params->result = AUDCLNT_E_DEVICE_INVALIDATED; goto done; }
++    if (stream->locked_data)
++    {
++        params->result = AUDCLNT_E_OUT_OF_ORDER;
++        goto done;
++    }
++    read_frames = __atomic_load_n(&stream->capture_read_frames, __ATOMIC_RELAXED);
++    write_frames = __atomic_load_n(&stream->capture_write_frames, __ATOMIC_ACQUIRE);
++    if (write_frames - read_frames < stream->period_frames)
++    {
++        *params->frames = 0;
++        params->result = AUDCLNT_S_BUFFER_EMPTY;
++        goto done;
++    }
++
++    frames = stream->period_frames;
++    pos = (UINT32)(read_frames % stream->buffer_frames);
++    first = min(frames, stream->buffer_frames - pos);
++    if (first == frames)
++    {
++        stream->locked_data = stream->buffer + (SIZE_T)pos * stream->frame_size;
++        stream->locked_tmp = FALSE;
++    }
++    else
++    {
++        bytes = (SIZE_T)frames * stream->frame_size;
++        if (stream->tmp_frames < frames)
++        {
++            low_free(stream->tmp_buffer);
++            stream->tmp_buffer = low_alloc(bytes);
++            if (!stream->tmp_buffer)
++            {
++                stream->tmp_frames = 0;
++                params->result = E_OUTOFMEMORY;
++                goto done;
++            }
++            stream->tmp_frames = frames;
++        }
++        copy_capture_ring_out(stream, stream->tmp_buffer, read_frames, frames);
++        stream->locked_data = stream->tmp_buffer;
++        stream->locked_tmp = TRUE;
++    }
++
++    lost_frames = (UINT64)InterlockedCompareExchange64(&stream->capture_lost_frames, 0, 0);
++    stream->locked_capture_lost_frames = lost_frames;
++    stream->locked_frames = frames;
++    *params->data = stream->locked_data;
++    *params->frames = frames;
++    *params->flags = lost_frames != stream->capture_reported_lost_frames
++                     ? AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY : 0;
++    if (params->devpos)
++    {
++        captured_frames = (UINT64)InterlockedCompareExchange64(&stream->device_frames, 0, 0);
++        *params->devpos = captured_frames >= write_frames - read_frames
++                          ? captured_frames - (write_frames - read_frames) : 0;
++    }
++    if (params->qpcpos)
++    {
++        NtQueryPerformanceCounter(&counter, &freq);
++        *params->qpcpos = qpc_to_100ns(counter.QuadPart, freq.QuadPart);
++    }
++    params->result = S_OK;
++
++ done:
++    pthread_mutex_unlock(&stream->mutex);
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS aaudio_release_capture_buffer(void *args)
++{
++    struct release_capture_buffer_params *params = args;
++    struct aaudio_stream *stream = stream_from_handle(params->stream);
++    UINT64 read_frames;
++
++    if (!stream || stream->flow != eCapture)
++    {
++        params->result = AUDCLNT_E_WRONG_ENDPOINT_TYPE;
++        return STATUS_SUCCESS;
++    }
++
++    pthread_mutex_lock(&stream->mutex);
++    if (stream_endpoint_invalidated(stream)) { params->result = AUDCLNT_E_DEVICE_INVALIDATED; goto done; }
++    if (!stream->locked_data)
++    {
++        params->result = AUDCLNT_E_OUT_OF_ORDER;
++        goto done;
++    }
++    if (params->done && params->done != stream->locked_frames)
++    {
++        params->result = AUDCLNT_E_INVALID_SIZE;
++        goto done;
++    }
++    if (params->done)
++    {
++        read_frames = __atomic_load_n(&stream->capture_read_frames, __ATOMIC_RELAXED);
++        __atomic_store_n(&stream->capture_read_frames, read_frames + params->done, __ATOMIC_RELEASE);
++        stream->capture_reported_lost_frames = stream->locked_capture_lost_frames;
++    }
++    stream->locked_data = NULL;
++    stream->locked_frames = 0;
++    stream->locked_tmp = FALSE;
++    params->result = S_OK;
++
++ done:
++    pthread_mutex_unlock(&stream->mutex);
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS aaudio_is_format_supported(void *args)
++{
++    struct is_format_supported_params *params = args;
++
++    if (params->share == AUDCLNT_SHAREMODE_EXCLUSIVE)
++        params->result = AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED;
++    else
++        params->result = probe_native_format(params->device, params->flow, params->fmt_in);
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS aaudio_get_loopback_capture_device(void *args)
++{
++    struct get_loopback_capture_device_params *params = args;
++    params->result = E_NOTIMPL;
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS aaudio_get_mix_format(void *args)
++{
++    struct get_mix_format_params *params = args;
++    fill_mix_format(params->flow, params->fmt);
++    params->result = S_OK;
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS aaudio_get_device_period(void *args)
++{
++    struct get_device_period_params *params = args;
++
++    if (!params->def_period && !params->min_period)
++    {
++        params->result = E_POINTER;
++        return STATUS_SUCCESS;
++    }
++
++    if (params->def_period) *params->def_period = DEFAULT_PERIOD_100NS;
++    if (params->min_period) *params->min_period = MIN_PERIOD_100NS;
++    params->result = S_OK;
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS aaudio_get_buffer_size(void *args)
++{
++    struct get_buffer_size_params *params = args;
++    struct aaudio_stream *stream = stream_from_handle(params->stream);
++    if (!stream) params->result = AUDCLNT_E_DEVICE_INVALIDATED;
++    else
++    {
++        pthread_mutex_lock(&stream->mutex);
++        if (stream_endpoint_invalidated(stream)) params->result = AUDCLNT_E_DEVICE_INVALIDATED;
++        else { *params->frames = stream->buffer_frames; params->result = S_OK; }
++        pthread_mutex_unlock(&stream->mutex);
++    }
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS aaudio_get_latency(void *args)
++{
++    struct get_latency_params *params = args;
++    struct aaudio_stream *stream = stream_from_handle(params->stream);
++    int32_t native_frames;
++
++    if (!stream) { params->result = AUDCLNT_E_DEVICE_INVALIDATED; return STATUS_SUCCESS; }
++    pthread_mutex_lock(&stream->mutex);
++    if (stream_endpoint_invalidated(stream)) { params->result = AUDCLNT_E_DEVICE_INVALIDATED; goto done; }
++
++    native_frames = stream->native ? AAudioStream_getBufferSizeInFrames(stream->native) : 0;
++    if (native_frames <= 0 && stream->native) native_frames = AAudioStream_getFramesPerBurst(stream->native);
++    if (native_frames <= 0) native_frames = stream->period_frames;
++    *params->latency = (REFERENCE_TIME)((UINT64)native_frames * 10000000 / stream->rate);
++    params->result = S_OK;
++
++done:
++    pthread_mutex_unlock(&stream->mutex);
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS aaudio_get_current_padding(void *args)
++{
++    struct get_current_padding_params *params = args;
++    struct aaudio_stream *stream = stream_from_handle(params->stream);
++    if (!stream) { params->result = AUDCLNT_E_DEVICE_INVALIDATED; return STATUS_SUCCESS; }
++    pthread_mutex_lock(&stream->mutex);
++    if (stream_endpoint_invalidated(stream)) params->result = AUDCLNT_E_DEVICE_INVALIDATED;
++    else
++    {
++        if (stream->flow == eCapture)
++        {
++            UINT64 read_frames = __atomic_load_n(&stream->capture_read_frames, __ATOMIC_ACQUIRE);
++            UINT64 write_frames = __atomic_load_n(&stream->capture_write_frames, __ATOMIC_ACQUIRE);
++            *params->padding = (UINT32)((write_frames - read_frames) / stream->period_frames * stream->period_frames);
++        }
++        else
++        {
++            UINT64 read_frames = __atomic_load_n(&stream->render_read_frames, __ATOMIC_ACQUIRE);
++            UINT64 write_frames = __atomic_load_n(&stream->render_write_frames, __ATOMIC_ACQUIRE);
++            *params->padding = (UINT32)(write_frames - read_frames);
++        }
++        params->result = S_OK;
++    }
++    pthread_mutex_unlock(&stream->mutex);
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS aaudio_get_next_packet_size(void *args)
++{
++    struct get_next_packet_size_params *params = args;
++    struct aaudio_stream *stream = stream_from_handle(params->stream);
++    if (!stream || stream->flow != eCapture) { params->result = AUDCLNT_E_WRONG_ENDPOINT_TYPE; return STATUS_SUCCESS; }
++    pthread_mutex_lock(&stream->mutex);
++    if (stream_endpoint_invalidated(stream)) params->result = AUDCLNT_E_DEVICE_INVALIDATED;
++    else
++    {
++        UINT64 read_frames = __atomic_load_n(&stream->capture_read_frames, __ATOMIC_ACQUIRE);
++        UINT64 write_frames = __atomic_load_n(&stream->capture_write_frames, __ATOMIC_ACQUIRE);
++        *params->frames = write_frames - read_frames >= stream->period_frames ? stream->period_frames : 0;
++        params->result = S_OK;
++    }
++    pthread_mutex_unlock(&stream->mutex);
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS aaudio_get_frequency(void *args)
++{
++    struct get_frequency_params *params = args;
++    struct aaudio_stream *stream = stream_from_handle(params->stream);
++    if (!stream) { params->result = AUDCLNT_E_DEVICE_INVALIDATED; return STATUS_SUCCESS; }
++    pthread_mutex_lock(&stream->mutex);
++    if (stream_endpoint_invalidated(stream)) params->result = AUDCLNT_E_DEVICE_INVALIDATED;
++    else
++    {
++        *params->freq = stream->rate;
++        if (stream->share == AUDCLNT_SHAREMODE_SHARED) *params->freq *= stream->frame_size;
++        params->result = S_OK;
++    }
++    pthread_mutex_unlock(&stream->mutex);
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS aaudio_get_position(void *args)
++{
++    struct get_position_params *params = args;
++    struct aaudio_stream *stream = stream_from_handle(params->stream);
++    UINT64 frames;
++
++    if (!stream) { params->result = AUDCLNT_E_DEVICE_INVALIDATED; return STATUS_SUCCESS; }
++
++    pthread_mutex_lock(&stream->mutex);
++    if (stream_endpoint_invalidated(stream))
++    {
++        params->result = AUDCLNT_E_DEVICE_INVALIDATED;
++        pthread_mutex_unlock(&stream->mutex);
++        return STATUS_SUCCESS;
++    }
++
++    audio_clock_update(stream);
++    frames = stream->clock_position_frames;
++    *params->pos = (stream->share == AUDCLNT_SHAREMODE_EXCLUSIVE || params->device)
++                   ? frames : frames * stream->frame_size;
++    if (params->qpctime)
++        *params->qpctime = stream->started && stream->clock_has_timestamp && stream->clock_qpc_100ns
++                           ? stream->clock_qpc_100ns : audio_clock_qpc_now();
++    params->result = S_OK;
++    pthread_mutex_unlock(&stream->mutex);
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS aaudio_set_volumes(void *args)
++{
++    struct set_volumes_params *params = args;
++    struct aaudio_stream *stream = stream_from_handle(params->stream);
++    unsigned int i;
++    if (!stream) return STATUS_SUCCESS;
++    pthread_mutex_lock(&stream->mutex);
++    if (!stream_endpoint_invalidated(stream))
++    {
++        for (i = 0; i < stream->channels; ++i)
++        {
++            float gain = params->volumes[i] * params->master_volume * params->session_volumes[i];
++            __atomic_store(&stream->volumes[i], &gain, __ATOMIC_RELAXED);
++        }
++    }
++    pthread_mutex_unlock(&stream->mutex);
++    return STATUS_SUCCESS;
++}
++
++static BOOL is_valid_event_handle(HANDLE handle)
++{
++    union
++    {
++        OBJECT_TYPE_INFORMATION type;
++        BYTE storage[1024];
++    } info;
++    static const WCHAR event_type[] = {'E', 'v', 'e', 'n', 't'};
++    NTSTATUS status;
++
++    if (!handle) return FALSE;
++    status = NtQueryObject(handle, ObjectTypeInformation, &info, sizeof(info), NULL);
++    if (status) return FALSE;
++    return info.type.TypeName.Buffer && info.type.TypeName.Length == sizeof(event_type) &&
++           !memcmp(info.type.TypeName.Buffer, event_type, sizeof(event_type));
++}
++
++static NTSTATUS aaudio_set_event_handle(void *args)
++{
++    struct set_event_handle_params *params = args;
++    struct aaudio_stream *stream = stream_from_handle(params->stream);
++
++    if (!stream) { params->result = AUDCLNT_E_DEVICE_INVALIDATED; return STATUS_SUCCESS; }
++
++    pthread_mutex_lock(&stream->mutex);
++    if (stream_endpoint_invalidated(stream))
++        params->result = AUDCLNT_E_DEVICE_INVALIDATED;
++    else if (!(stream->flags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK))
++        params->result = AUDCLNT_E_EVENTHANDLE_NOT_EXPECTED;
++    else if (stream->event)
++        params->result = HRESULT_FROM_WIN32(ERROR_INVALID_NAME);
++    else if (!is_valid_event_handle(params->event))
++        params->result = E_INVALIDARG;
++    else
++    {
++        stream->event = params->event;
++        params->result = S_OK;
++    }
++    pthread_mutex_unlock(&stream->mutex);
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS aaudio_set_sample_rate(void *args)
++{
++    struct set_sample_rate_params *params = args;
++    struct aaudio_stream *stream = stream_from_handle(params->stream);
++
++    if (!stream) { params->result = AUDCLNT_E_DEVICE_INVALIDATED; return STATUS_SUCCESS; }
++    pthread_mutex_lock(&stream->mutex);
++    if (stream_endpoint_invalidated(stream)) params->result = AUDCLNT_E_DEVICE_INVALIDATED;
++    else if (stream->flow != eRender) params->result = E_NOTIMPL;
++    else if (params->rate == stream->rate) params->result = S_OK;
++    else params->result = E_NOTIMPL;
++    pthread_mutex_unlock(&stream->mutex);
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS aaudio_test_connect(void *args)
++{
++    struct test_connect_params *params = args;
++    AAudioStreamBuilder *builder = NULL;
++    AAudioStream *stream = NULL;
++    aaudio_result_t result;
++
++    params->priority = Priority_Unavailable;
++
++    pthread_mutex_lock(&aaudio_lifecycle_mutex);
++
++    result = AAudio_createStreamBuilder(&builder);
++    if (result != AAUDIO_OK || !builder) goto done;
++
++    configure_builder(builder, eRender, DEFAULT_RATE, DEFAULT_RENDER_CHANNELS, TRUE, AAUDIO_UNSPECIFIED);
++    result = AAudioStreamBuilder_openStream(builder, &stream);
++    AAudioStreamBuilder_delete(builder);
++    builder = NULL;
++
++    if (result == AAUDIO_OK && stream)
++        params->priority = Priority_Preferred;
++
++done:
++    if (stream) AAudioStream_close(stream);
++    if (builder) AAudioStreamBuilder_delete(builder);
++    pthread_mutex_unlock(&aaudio_lifecycle_mutex);
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS aaudio_is_started(void *args)
++{
++    struct is_started_params *params = args;
++    struct aaudio_stream *stream = stream_from_handle(params->stream);
++
++    if (!stream) params->result = S_FALSE;
++    else
++    {
++        pthread_mutex_lock(&stream->mutex);
++        params->result = !stream_disconnected(stream) && stream->started ? S_OK : S_FALSE;
++        pthread_mutex_unlock(&stream->mutex);
++    }
++    return STATUS_SUCCESS;
++}
++
++static void make_container_id(UINT64 key, GUID *guid)
++{
++    static const GUID base =
++        {0xa4aa8179, 0x4bb0, 0x4d8b, {0x96, 0x10, 0xe5, 0x2c, 0x3e, 0xb8, 0x15, 0x21}};
++
++    *guid = base;
++    if (!key) return;
++    guid->Data1 ^= (UINT32)key;
++    guid->Data2 ^= (UINT16)(key >> 32);
++    guid->Data3 ^= (UINT16)(key >> 48);
++}
++
++static UINT make_device_path(const char *device, EDataFlow flow, WCHAR *path, UINT capacity)
++{
++    static const WCHAR render_default[] = {'{','1','}','.','R','O','O','T','\\','M','E','D','I','A','\\','A','A','U','D','I','O','_','R','E','N','D','E','R',0};
++    static const WCHAR capture_default[] = {'{','1','}','.','R','O','O','T','\\','M','E','D','I','A','\\','A','A','U','D','I','O','_','C','A','P','T','U','R','E',0};
++    const WCHAR *default_path = flow == eCapture ? capture_default : render_default;
++    char ascii[96];
++    UINT64 key;
++    UINT length, i;
++
++    if (!parse_device_key(device, flow, &key) || !key)
++    {
++        length = lstrlenW(default_path);
++        if (path && capacity > length)
++            memcpy(path, default_path, (length + 1) * sizeof(WCHAR));
++        return length;
++    }
++
++    snprintf(ascii, sizeof(ascii), "{1}.ROOT\\MEDIA\\AAUDIO_%s\\%016llx",
++             flow == eCapture ? "CAPTURE" : "RENDER", (unsigned long long)key);
++    length = strlen(ascii);
++    if (path && capacity > length)
++    {
++        for (i = 0; i <= length; ++i) path[i] = (unsigned char)ascii[i];
++    }
++    return length;
++}
++
++static NTSTATUS aaudio_get_prop_value(void *args)
++{
++    static const GUID audioendpoint_guid =
++        {0x1da5d803, 0xd492, 0x4edd, {0x8c, 0x23, 0xe0, 0xc0, 0xff, 0xee, 0x7f, 0x0e}};
++    static const PROPERTYKEY devicepath_key =
++        {{0xb3f8fa53, 0x0004, 0x438e, {0x90, 0x03, 0x51, 0xa4, 0x6e, 0x13, 0x9b, 0xfc}}, 2};
++    struct get_prop_value_params *params = args;
++    UINT64 device_key = 0;
++    SIZE_T bytes;
++
++    if (!params->prop || !params->value || !params->buffer_size)
++    {
++        params->result = E_INVALIDARG;
++        return STATUS_SUCCESS;
++    }
++
++    parse_device_key(params->device, params->flow, &device_key);
++    PropVariantInit(params->value);
++    if (IsEqualPropertyKey(*params->prop, devicepath_key))
++    {
++        UINT length = make_device_path(params->device, params->flow, NULL, 0);
++        bytes = (length + 1) * sizeof(WCHAR);
++        if (!params->buffer || *params->buffer_size < bytes)
++        {
++            *params->buffer_size = bytes;
++            params->result = E_NOT_SUFFICIENT_BUFFER;
++            return STATUS_SUCCESS;
++        }
++        make_device_path(params->device, params->flow, params->buffer, *params->buffer_size / sizeof(WCHAR));
++        params->value->vt = VT_LPWSTR;
++        params->value->pwszVal = params->buffer;
++        params->result = S_OK;
++        return STATUS_SUCCESS;
++    }
++    if (IsEqualGUID(&params->prop->fmtid, &audioendpoint_guid))
++    {
++        switch (params->prop->pid)
++        {
++        case 0: /* FormFactor */
++            params->value->vt = VT_UI4;
++            params->value->ulVal = params->flow == eCapture ? Microphone : Speakers;
++            params->result = S_OK;
++            return STATUS_SUCCESS;
++        case 3: /* PhysicalSpeakers */
++            if (params->flow != eRender) break;
++            params->value->vt = VT_UI4;
++            params->value->ulVal = KSAUDIO_SPEAKER_STEREO;
++            params->result = S_OK;
++            return STATUS_SUCCESS;
++        }
++    }
++    if (IsEqualPropertyKey(*params->prop, aaudio_devpkey_device_container_id))
++    {
++        GUID container_id;
++
++        bytes = sizeof(GUID);
++        if (!params->buffer || *params->buffer_size < bytes)
++        {
++            *params->buffer_size = bytes;
++            params->result = E_NOT_SUFFICIENT_BUFFER;
++            return STATUS_SUCCESS;
++        }
++        make_container_id(device_key, &container_id);
++        params->value->vt = VT_CLSID;
++        params->value->puuid = params->buffer;
++        *params->value->puuid = container_id;
++        params->result = S_OK;
++        return STATUS_SUCCESS;
++    }
++
++    params->result = E_NOTIMPL;
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS aaudio_midi_get_driver(void *args)
++{
++    static const WCHAR driver[] = {'a','l','s','a',0};
++    memcpy(args, driver, sizeof(driver));
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS aaudio_midi_init(void *args) { return STATUS_SUCCESS; }
++static NTSTATUS aaudio_midi_release(void *args) { return STATUS_SUCCESS; }
++static NTSTATUS aaudio_midi_out_message(void *args) { return STATUS_SUCCESS; }
++static NTSTATUS aaudio_midi_in_message(void *args) { return STATUS_SUCCESS; }
++static NTSTATUS aaudio_midi_notify_wait(void *args) { return STATUS_SUCCESS; }
++static NTSTATUS aaudio_aux_message(void *args) { return STATUS_SUCCESS; }
++
++const unixlib_entry_t __wine_unix_call_funcs[] =
++{
++    aaudio_process_attach,
++    aaudio_process_detach,
++    aaudio_main_loop,
++    aaudio_get_endpoint_ids,
++    aaudio_create_stream,
++    aaudio_release_stream,
++    aaudio_start,
++    aaudio_stop,
++    aaudio_reset,
++    aaudio_timer_loop,
++    aaudio_get_render_buffer,
++    aaudio_release_render_buffer,
++    aaudio_get_capture_buffer,
++    aaudio_release_capture_buffer,
++    aaudio_is_format_supported,
++    aaudio_get_loopback_capture_device,
++    aaudio_get_mix_format,
++    aaudio_get_device_period,
++    aaudio_get_buffer_size,
++    aaudio_get_latency,
++    aaudio_get_current_padding,
++    aaudio_get_next_packet_size,
++    aaudio_get_frequency,
++    aaudio_get_position,
++    aaudio_set_volumes,
++    aaudio_set_event_handle,
++    aaudio_set_sample_rate,
++    aaudio_test_connect,
++    aaudio_is_started,
++    aaudio_get_prop_value,
++    aaudio_midi_get_driver,
++    aaudio_midi_init,
++    aaudio_midi_release,
++    aaudio_midi_out_message,
++    aaudio_midi_in_message,
++    aaudio_midi_notify_wait,
++    aaudio_aux_message,
++};
++C_ASSERT(ARRAYSIZE(__wine_unix_call_funcs) == funcs_count);
++
++#ifdef _WIN64
++#define PTR32 UINT
++
++static NTSTATUS wow64_main_loop(void *args)
++{
++    struct { UINT event; } *p = args;
++    struct main_loop_params params = { ULongToHandle(p->event) };
++    return aaudio_main_loop(&params);
++}
++
++static NTSTATUS wow64_get_endpoint_ids(void *args)
++{
++    struct { EDataFlow flow; PTR32 endpoints; unsigned int size; HRESULT result; unsigned int num; unsigned int default_idx; } *p = args;
++    struct get_endpoint_ids_params params = { p->flow, ULongToPtr(p->endpoints), p->size, p->result, p->num, p->default_idx };
++    NTSTATUS status = aaudio_get_endpoint_ids(&params);
++    p->size = params.size; p->result = params.result; p->num = params.num; p->default_idx = params.default_idx;
++    return status;
++}
++
++static NTSTATUS wow64_create_stream(void *args)
++{
++    struct { PTR32 name; PTR32 device; EDataFlow flow; AUDCLNT_SHAREMODE share; DWORD flags; REFERENCE_TIME duration; REFERENCE_TIME period; PTR32 fmt; HRESULT result; PTR32 channel_count; PTR32 stream; } *p = args;
++    struct create_stream_params params = { ULongToPtr(p->name), ULongToPtr(p->device), p->flow, p->share, p->flags, p->duration, p->period, ULongToPtr(p->fmt), p->result, ULongToPtr(p->channel_count), ULongToPtr(p->stream) };
++    NTSTATUS status = aaudio_create_stream(&params);
++    p->result = params.result;
++    return status;
++}
++
++static NTSTATUS wow64_release_stream(void *args)
++{
++    struct { stream_handle stream; UINT timer_thread; HRESULT result; } *p = args;
++    struct release_stream_params params = { p->stream, ULongToHandle(p->timer_thread), p->result };
++    NTSTATUS status = aaudio_release_stream(&params); p->result = params.result; return status;
++}
++
++static NTSTATUS wow64_get_render_buffer(void *args)
++{
++    struct { stream_handle stream; UINT32 frames; HRESULT result; PTR32 data; } *p = args;
++    BYTE *data = NULL;
++    struct get_render_buffer_params params = { p->stream, p->frames, p->result, &data };
++    NTSTATUS status = aaudio_get_render_buffer(&params);
++    p->result = params.result;
++    *(UINT *)ULongToPtr(p->data) = PtrToUlong(data);
++    return status;
++}
++
++static NTSTATUS wow64_get_capture_buffer(void *args)
++{
++    struct { stream_handle stream; HRESULT result; PTR32 data; PTR32 frames; PTR32 flags; PTR32 devpos; PTR32 qpcpos; } *p = args;
++    BYTE *data = NULL;
++    struct get_capture_buffer_params params = { p->stream, p->result, &data, ULongToPtr(p->frames), ULongToPtr(p->flags), ULongToPtr(p->devpos), ULongToPtr(p->qpcpos) };
++    NTSTATUS status = aaudio_get_capture_buffer(&params);
++    p->result = params.result;
++    *(UINT *)ULongToPtr(p->data) = PtrToUlong(data);
++    return status;
++}
++
++static NTSTATUS wow64_is_format_supported(void *args)
++{
++    struct { PTR32 device; EDataFlow flow; AUDCLNT_SHAREMODE share; PTR32 fmt_in; HRESULT result; } *p = args;
++    struct is_format_supported_params params = { ULongToPtr(p->device), p->flow, p->share, ULongToPtr(p->fmt_in), p->result };
++    NTSTATUS status = aaudio_is_format_supported(&params); p->result = params.result; return status;
++}
++
++static NTSTATUS wow64_get_loopback_capture_device(void *args)
++{
++    struct { PTR32 name; PTR32 device; PTR32 ret_device; UINT32 ret_device_len; HRESULT result; } *p = args;
++    struct get_loopback_capture_device_params params = { ULongToPtr(p->name), ULongToPtr(p->device), ULongToPtr(p->ret_device), p->ret_device_len, p->result };
++    NTSTATUS status = aaudio_get_loopback_capture_device(&params);
++    p->ret_device_len = params.ret_device_len;
++    p->result = params.result;
++    return status;
++}
++
++static NTSTATUS wow64_get_mix_format(void *args)
++{
++    struct { PTR32 device; EDataFlow flow; PTR32 fmt; HRESULT result; } *p = args;
++    struct get_mix_format_params params = { ULongToPtr(p->device), p->flow, ULongToPtr(p->fmt), p->result };
++    NTSTATUS status = aaudio_get_mix_format(&params); p->result = params.result; return status;
++}
++
++static NTSTATUS wow64_get_device_period(void *args)
++{
++    struct { PTR32 device; EDataFlow flow; HRESULT result; PTR32 def_period; PTR32 min_period; } *p = args;
++    struct get_device_period_params params = { ULongToPtr(p->device), p->flow, p->result, ULongToPtr(p->def_period), ULongToPtr(p->min_period) };
++    NTSTATUS status = aaudio_get_device_period(&params); p->result = params.result; return status;
++}
++
++#define WOW64_SIMPLE_PTR_WRAPPER(name, type, member) \
++static NTSTATUS wow64_##name(void *args) { \
++    struct { stream_handle stream; HRESULT result; PTR32 member; } *p = args; \
++    struct type params = { p->stream, p->result, ULongToPtr(p->member) }; \
++    NTSTATUS status = aaudio_##name(&params); p->result = params.result; return status; }
++
++WOW64_SIMPLE_PTR_WRAPPER(get_buffer_size, get_buffer_size_params, frames)
++WOW64_SIMPLE_PTR_WRAPPER(get_latency, get_latency_params, latency)
++WOW64_SIMPLE_PTR_WRAPPER(get_current_padding, get_current_padding_params, padding)
++WOW64_SIMPLE_PTR_WRAPPER(get_next_packet_size, get_next_packet_size_params, frames)
++WOW64_SIMPLE_PTR_WRAPPER(get_frequency, get_frequency_params, freq)
++
++static NTSTATUS wow64_get_position(void *args)
++{
++    struct { stream_handle stream; BOOL device; HRESULT result; PTR32 pos; PTR32 qpctime; } *p = args;
++    struct get_position_params params = { p->stream, p->device, p->result, ULongToPtr(p->pos), ULongToPtr(p->qpctime) };
++    NTSTATUS status = aaudio_get_position(&params); p->result = params.result; return status;
++}
++
++static NTSTATUS wow64_set_volumes(void *args)
++{
++    struct { stream_handle stream; float master_volume; PTR32 volumes; PTR32 session_volumes; } *p = args;
++    struct set_volumes_params params = { p->stream, p->master_volume, ULongToPtr(p->volumes), ULongToPtr(p->session_volumes) };
++    return aaudio_set_volumes(&params);
++}
++
++static NTSTATUS wow64_set_event_handle(void *args)
++{
++    struct { stream_handle stream; UINT event; HRESULT result; } *p = args;
++    struct set_event_handle_params params = { p->stream, ULongToHandle(p->event), p->result };
++    NTSTATUS status = aaudio_set_event_handle(&params); p->result = params.result; return status;
++}
++
++static NTSTATUS wow64_test_connect(void *args)
++{
++    struct { PTR32 name; enum driver_priority priority; } *p = args;
++    struct test_connect_params params = { .name = ULongToPtr(p->name) };
++    NTSTATUS status = aaudio_test_connect(&params);
++    p->priority = params.priority;
++    return status;
++}
++
++static NTSTATUS wow64_get_prop_value(void *args)
++{
++    struct propvariant32
++    {
++        WORD vt;
++        WORD pad1, pad2, pad3;
++        union
++        {
++            ULONG ulVal;
++            PTR32 ptr;
++            ULARGE_INTEGER uhVal;
++        };
++    } *value32;
++    struct
++    {
++        PTR32 device;
++        EDataFlow flow;
++        PTR32 guid;
++        PTR32 prop;
++        HRESULT result;
++        PTR32 value;
++        PTR32 buffer;
++        PTR32 buffer_size;
++    } *p = args;
++    PROPVARIANT value;
++    struct get_prop_value_params params =
++    {
++        .device = ULongToPtr(p->device),
++        .flow = p->flow,
++        .guid = ULongToPtr(p->guid),
++        .prop = ULongToPtr(p->prop),
++        .value = &value,
++        .buffer = ULongToPtr(p->buffer),
++        .buffer_size = ULongToPtr(p->buffer_size),
++    };
++    NTSTATUS status = aaudio_get_prop_value(&params);
++    p->result = params.result;
++    if (SUCCEEDED(params.result))
++    {
++        value32 = ULongToPtr(p->value);
++        value32->vt = value.vt;
++        switch (value.vt)
++        {
++        case VT_UI4:
++            value32->ulVal = value.ulVal;
++            break;
++        case VT_LPWSTR:
++        case VT_CLSID:
++            value32->ptr = p->buffer;
++            break;
++        default:
++            FIXME("Unhandled vt %04x\n", value.vt);
++            break;
++        }
++    }
++    return status;
++}
++
++const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
++{
++    aaudio_process_attach,
++    aaudio_process_detach,
++    wow64_main_loop,
++    wow64_get_endpoint_ids,
++    wow64_create_stream,
++    wow64_release_stream,
++    aaudio_start,
++    aaudio_stop,
++    aaudio_reset,
++    aaudio_timer_loop,
++    wow64_get_render_buffer,
++    aaudio_release_render_buffer,
++    wow64_get_capture_buffer,
++    aaudio_release_capture_buffer,
++    wow64_is_format_supported,
++    wow64_get_loopback_capture_device,
++    wow64_get_mix_format,
++    wow64_get_device_period,
++    wow64_get_buffer_size,
++    wow64_get_latency,
++    wow64_get_current_padding,
++    wow64_get_next_packet_size,
++    wow64_get_frequency,
++    wow64_get_position,
++    wow64_set_volumes,
++    wow64_set_event_handle,
++    aaudio_set_sample_rate,
++    wow64_test_connect,
++    aaudio_is_started,
++    wow64_get_prop_value,
++    aaudio_midi_get_driver,
++    aaudio_midi_init,
++    aaudio_midi_release,
++    aaudio_midi_out_message,
++    aaudio_midi_in_message,
++    aaudio_midi_notify_wait,
++    aaudio_aux_message,
++};
++C_ASSERT(ARRAYSIZE(__wine_unix_call_wow64_funcs) == funcs_count);
++#endif

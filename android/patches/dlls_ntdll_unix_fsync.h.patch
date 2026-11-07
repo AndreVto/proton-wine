@@ -1,0 +1,15 @@
+diff --git a/dlls/ntdll/unix/fsync.h b/dlls/ntdll/unix/fsync.h
+index 3dfdd91b74e..f47a2e37ad3 100644
+--- a/dlls/ntdll/unix/fsync.h
++++ b/dlls/ntdll/unix/fsync.h
+@@ -20,6 +20,10 @@
+ 
+ extern void fsync_init( DWORD pid );
+ extern NTSTATUS fsync_close( HANDLE handle );
++#ifdef __ANDROID__
++extern unsigned int fsync_import_drm_fd( int fd );
++extern void fsync_destroy_drm_handle( unsigned int handle );
++#endif
+ 
+ extern NTSTATUS fsync_release_semaphore( HANDLE handle, ULONG count, ULONG *prev );
+ extern NTSTATUS fsync_query_semaphore( HANDLE handle, void *info );

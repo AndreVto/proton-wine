@@ -1,0 +1,50 @@
+diff --git a/server/unicode.c b/server/unicode.c
+index bb39b55e50c..a8602b275d9 100644
+--- a/server/unicode.c
++++ b/server/unicode.c
+@@ -60,6 +60,7 @@ static const unsigned int utf8_minval[4] = { 0x0, 0x80, 0x800, 0x10000 };
+ 
+ static unsigned short *casemap;
+ 
++
+ static inline char to_hex( char ch )
+ {
+     if (isdigit(ch)) return ch - '0';
+@@ -279,7 +280,9 @@ static char *get_nls_dir(void)
+ {
+     char *p, *dir, *ret;
+ 
+-#if defined(__linux__) || defined(__FreeBSD_kernel__) || defined(__NetBSD__)
++#if defined(__ANDROID__)
++    dir = realpath( server_argv0, NULL );
++#elif defined(__linux__) || defined(__FreeBSD_kernel__) || defined(__NetBSD__)
+     dir = realpath( "/proc/self/exe", NULL );
+ #elif defined (__FreeBSD__) || defined(__DragonFly__)
+     static int pathname[] = { CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, -1 };
+@@ -348,6 +351,26 @@ struct fd *load_intl_file(void)
+                            FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT ))) break;
+         free( path );
+     }
++    if (!fd && getenv("XDG_DATA_DIRS"))
++    {
++        const char *dir = getenv("XDG_DATA_DIRS");
++        while (dir && *dir && !fd)
++        {
++            const char *end = strchr( dir, ':' );
++            size_t length = end ? (size_t)(end - dir) : strlen( dir );
++            char *candidate = NULL;
++            if (length && length <= INT_MAX &&
++                asprintf( &candidate, "%.*s/wine/nls/l_intl.nls", (int)length, dir ) != -1)
++            {
++                fd = open_fd( NULL, candidate, nt_name, O_RDONLY, &mode, FILE_READ_DATA,
++                              FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
++                              FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT );
++                if (fd) path = candidate;
++                else free( candidate );
++            }
++            dir = end ? end + 1 : NULL;
++        }
++    }
+     if (!fd) fatal_error( "failed to load l_intl.nls\n" );
+     unix_fd = get_unix_fd( fd );
+     /* read initial offset */

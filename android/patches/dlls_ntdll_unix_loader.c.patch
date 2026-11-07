@@ -1,0 +1,138 @@
+diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
+index 4deeac79c28..12c87ec75a8 100644
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -82,6 +82,9 @@
+ # include <jni.h>
+ #endif
+ 
++#ifdef __ANDROID__
++# include "process_relay.h"
++#endif
+ #include "ntstatus.h"
+ #define WIN32_NO_STATUS
+ #include "windef.h"
+@@ -317,7 +320,27 @@ static int build_path_and_exec( pid_t *pid, const char *dir, const char *name, c
+     int ret;
+ 
+     argv[0] = build_path( dir, name );
+-    ret = posix_spawn( pid, argv[0], NULL, NULL, argv, environ );
++#ifdef __ANDROID__
++    if (getenv( "WINE_ANDROID_PROCESS_BROKER" ))
++    {
++        unsigned int count = 0, i;
++        char **linker_argv;
++        while (argv[count]) count++;
++        linker_argv = malloc( (count + 2) * sizeof(*linker_argv) );
++        if (!linker_argv)
++        {
++            free( argv[0] );
++            return ENOMEM;
++        }
++        linker_argv[0] = (char *)"/system/bin/linker64";
++        for (i = 0; i < count; i++) linker_argv[i + 1] = argv[i];
++        linker_argv[count + 1] = NULL;
++        ret = posix_spawn( pid, linker_argv[0], NULL, NULL, linker_argv, environ );
++        free( linker_argv );
++    }
++    else
++#endif
++        ret = posix_spawn( pid, argv[0], NULL, NULL, argv, environ );
+     free( argv[0] );
+     return ret;
+ }
+@@ -340,7 +363,11 @@ static const char *get_pe_dir( WORD machine )
+     switch(machine)
+     {
+     case IMAGE_FILE_MACHINE_I386:  return "/i386-windows";
++#ifdef __aarch64__
++    case IMAGE_FILE_MACHINE_AMD64: return "/aarch64-windows";
++#else
+     case IMAGE_FILE_MACHINE_AMD64: return "/x86_64-windows";
++#endif
+     case IMAGE_FILE_MACHINE_ARMNT: return "/arm-windows";
+     case IMAGE_FILE_MACHINE_ARM64: return "/aarch64-windows";
+     default: return "";
+@@ -577,9 +604,22 @@ static NTSTATUS loader_exec( char **argv, WORD machine )
+ 
+     putenv( noexec );
+ 
+-    if (((argv[1] = get_alternate_wineloader( machine )))) preloader_exec( argv, machine );
++    if (!(argv[1] = get_alternate_wineloader( machine ))) argv[1] = strdup( wineloader );
++#ifdef __ANDROID__
++    if (getenv( "WINE_ANDROID_PROCESS_BROKER" ))
++    {
++        unsigned int argc = 0;
++        int ret;
+ 
+-    argv[1] = strdup( wineloader );
++        /* argv[0] is the preloader slot; forward argv[1..] to the process broker. */
++        while (argv[argc + 1]) argc++;
++        ret = wine_process_relay( argc, argv + 1 );
++        if (ret == 1) _exit(0);  /* process handoff completed */
++        fprintf( stderr, "wine: Android process relay failed: %s\n",
++                 strerror( ret < 0 ? -ret : EPROTO ) );
++        return STATUS_UNSUCCESSFUL;
++    }
++#endif
+     preloader_exec( argv, machine );
+     return STATUS_INVALID_IMAGE_FORMAT;
+ }
+@@ -2450,7 +2490,9 @@ static void start_main_thread(void)
+     set_thread_teb( teb );
+ #endif
+ 
++#ifdef M_PERTURB
+     mallopt( M_PERTURB, 0xff );
++#endif
+     init_startup_info();
+     *(ULONG_PTR *)&peb->CloudFileFlags = get_image_address();
+     set_load_order_app_name( main_wargv[0] );
+@@ -2459,7 +2501,9 @@ static void start_main_thread(void)
+     load_ntdll();
+     load_wow64_ntdll( main_image_info.Machine );
+     load_apiset_dll();
++#ifdef M_PERTURB
+     mallopt( M_PERTURB, 0 );
++#endif
+     server_init_process_done();
+ }
+ 
+@@ -2806,6 +2850,37 @@ static void check_command_line( int argc, char *argv[] )
+     reexec_loader( argc, argv, NULL );
+ }
+ 
++#ifdef __ANDROID__
++/* Report process exit through the callback */
++static void (*wine_android_exit_callback)( void *, int );
++static void *wine_android_exit_context;
++
++DECLSPEC_EXPORT void wine_android_set_exit_callback( void (*callback)( void *, int ), void *context )
++{
++    wine_android_exit_context = context;
++    wine_android_exit_callback = callback;
++}
++
++void wine_android_notify_exit( int status )
++{
++    if (wine_android_exit_callback)
++        wine_android_exit_callback( wine_android_exit_context, status );
++}
++
++/***********************************************************************
++ *           wine_android_main
++ */
++DECLSPEC_EXPORT void wine_android_main( int argc, char *argv[] )
++{
++    main_argc = argc;
++    main_argv = argv;
++
++    init_paths();
++    virtual_init();
++    init_environment();
++    start_main_thread();
++}
++#endif
+ 
+ /***********************************************************************
+  *           __wine_main

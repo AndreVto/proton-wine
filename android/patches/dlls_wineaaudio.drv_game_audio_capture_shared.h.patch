@@ -1,0 +1,196 @@
+diff --git a/dlls/wineaaudio.drv/game_audio_capture_shared.h b/dlls/wineaaudio.drv/game_audio_capture_shared.h
+new file mode 100644
+index 00000000000..13944a2bd21
+--- /dev/null
++++ b/dlls/wineaaudio.drv/game_audio_capture_shared.h
+@@ -0,0 +1,190 @@
++#pragma once
++
++#include <stdint.h>
++#include <string.h>
++
++#define ANDROID_AUDIO_CAPTURE_MAGIC 0x4c415243u
++#define ANDROID_AUDIO_CAPTURE_VERSION 6u
++#define ANDROID_AUDIO_CAPTURE_SLOT_COUNT 64u
++#define ANDROID_AUDIO_CAPTURE_RING_BYTES (128u * 1024u)
++
++#define ANDROID_AUDIO_CAPTURE_SLOT_FREE 0u
++#define ANDROID_AUDIO_CAPTURE_SLOT_CLAIMING 1u
++#define ANDROID_AUDIO_CAPTURE_SLOT_ACTIVE 2u
++#define ANDROID_AUDIO_CAPTURE_SLOT_RETIRED 3u
++
++#define ANDROID_AUDIO_CAPTURE_FORMAT_S16 1u
++#define ANDROID_AUDIO_CAPTURE_FORMAT_F32 2u
++
++struct android_audio_capture_packet {
++    uint64_t session_serial;
++    uint64_t stream_frame_position;
++    uint64_t callback_time_ns;
++    uint32_t frames;
++    uint32_t payload_bytes;
++};
++
++struct android_audio_capture_slot {
++    /* Slot state is published after the remaining claim metadata. */
++    uint32_t state;
++    uint32_t owner_pid;
++    uint64_t owner_token;
++
++    uint32_t sample_rate;
++    uint32_t channels;
++    uint32_t sample_format;
++    uint32_t frame_size;
++    uint32_t channel_mask;
++    uint32_t format_reserved;
++    uint32_t producer_active;
++    uint32_t producer_reserved;
++    uint64_t stream_epoch;
++
++    /* SPSC: producer owns write_pos; consumer owns read_pos. */
++    uint64_t write_pos;
++    uint64_t read_pos;
++    uint64_t dropped_frames;
++    uint64_t producer_frames;
++
++    /* Reserved for a presentation timestamp outside the audio callback. */
++    uint32_t timestamp_sequence;
++    int32_t timestamp_status;
++    int64_t timestamp_frame_position;
++    int64_t timestamp_ns;
++
++    uint8_t ring[ANDROID_AUDIO_CAPTURE_RING_BYTES];
++};
++
++struct android_audio_capture_shared {
++    uint32_t magic;
++    uint32_t version;
++    uint32_t slot_count;
++    uint32_t ring_bytes;
++
++    /* Recorder publishes enabled after session_serial. */
++    uint64_t session_serial;
++    uint32_t enabled;
++    uint32_t writers_inflight;
++
++    /* Reserved; the recorder polls without callback-thread wake syscalls. */
++    uint32_t wake_sequence;
++    uint32_t wake_reserved;
++
++    struct android_audio_capture_slot slots[ANDROID_AUDIO_CAPTURE_SLOT_COUNT];
++};
++
++static inline uint32_t android_audio_atomic_load_u32(const uint32_t *value)
++{
++    return __atomic_load_n(value, __ATOMIC_ACQUIRE);
++}
++
++static inline uint64_t android_audio_atomic_load_u64(const uint64_t *value)
++{
++    return __atomic_load_n(value, __ATOMIC_ACQUIRE);
++}
++
++static inline void android_audio_atomic_store_u32(uint32_t *value, uint32_t next)
++{
++    __atomic_store_n(value, next, __ATOMIC_RELEASE);
++}
++
++static inline void android_audio_atomic_store_u64(uint64_t *value, uint64_t next)
++{
++    __atomic_store_n(value, next, __ATOMIC_RELEASE);
++}
++
++static inline uint64_t android_audio_atomic_add_u64(uint64_t *value, uint64_t increment)
++{
++    return __atomic_add_fetch(value, increment, __ATOMIC_ACQ_REL);
++}
++
++static inline uint32_t android_audio_atomic_add_u32(uint32_t *value, uint32_t increment)
++{
++    return __atomic_add_fetch(value, increment, __ATOMIC_ACQ_REL);
++}
++
++static inline uint32_t android_audio_atomic_sub_u32(uint32_t *value, uint32_t decrement)
++{
++    return __atomic_sub_fetch(value, decrement, __ATOMIC_ACQ_REL);
++}
++
++
++static inline void android_audio_ring_copy_in(struct android_audio_capture_slot *slot,
++                                           uint64_t absolute_pos,
++                                           const void *src, uint32_t bytes)
++{
++    uint32_t offset = (uint32_t)(absolute_pos % ANDROID_AUDIO_CAPTURE_RING_BYTES);
++    uint32_t first = bytes < (ANDROID_AUDIO_CAPTURE_RING_BYTES - offset)
++        ? bytes : (ANDROID_AUDIO_CAPTURE_RING_BYTES - offset);
++    memcpy(slot->ring + offset, src, first);
++    if (first < bytes)
++        memcpy(slot->ring, (const uint8_t *)src + first, bytes - first);
++}
++
++static inline void android_audio_ring_copy_out(const struct android_audio_capture_slot *slot,
++                                            uint64_t absolute_pos,
++                                            void *dst, uint32_t bytes)
++{
++    uint32_t offset = (uint32_t)(absolute_pos % ANDROID_AUDIO_CAPTURE_RING_BYTES);
++    uint32_t first = bytes < (ANDROID_AUDIO_CAPTURE_RING_BYTES - offset)
++        ? bytes : (ANDROID_AUDIO_CAPTURE_RING_BYTES - offset);
++    memcpy(dst, slot->ring + offset, first);
++    if (first < bytes)
++        memcpy((uint8_t *)dst + first, slot->ring, bytes - first);
++}
++
++/* 1: packet published; 0: insufficient ring space. */
++static inline int android_audio_capture_write_packet(
++    struct android_audio_capture_slot *slot,
++    const struct android_audio_capture_packet *packet,
++    const void *payload)
++{
++    uint64_t write_pos = android_audio_atomic_load_u64(&slot->write_pos);
++    uint64_t read_pos = android_audio_atomic_load_u64(&slot->read_pos);
++    uint64_t used = write_pos - read_pos;
++    uint32_t total_bytes = (uint32_t)sizeof(*packet) + packet->payload_bytes;
++
++    android_audio_atomic_add_u64(&slot->producer_frames, packet->frames);
++    if (total_bytes > ANDROID_AUDIO_CAPTURE_RING_BYTES ||
++        used > ANDROID_AUDIO_CAPTURE_RING_BYTES ||
++        total_bytes > ANDROID_AUDIO_CAPTURE_RING_BYTES - used) {
++        android_audio_atomic_add_u64(&slot->dropped_frames, packet->frames);
++        return 0;
++    }
++
++    android_audio_ring_copy_in(slot, write_pos, packet, (uint32_t)sizeof(*packet));
++    android_audio_ring_copy_in(slot, write_pos + sizeof(*packet), payload, packet->payload_bytes);
++    android_audio_atomic_store_u64(&slot->write_pos, write_pos + total_bytes);
++    return 1;
++}
++
++/* 1: packet read; 0: incomplete or empty; -1: corrupt metadata. */
++static inline int android_audio_capture_read_packet(
++    struct android_audio_capture_slot *slot,
++    struct android_audio_capture_packet *packet,
++    void *payload, uint32_t payload_capacity)
++{
++    uint64_t read_pos = android_audio_atomic_load_u64(&slot->read_pos);
++    uint64_t write_pos = android_audio_atomic_load_u64(&slot->write_pos);
++    uint64_t available = write_pos - read_pos;
++    uint32_t total_bytes;
++
++    if (available < sizeof(*packet)) return 0;
++    if (available > ANDROID_AUDIO_CAPTURE_RING_BYTES) {
++        android_audio_atomic_store_u64(&slot->read_pos, write_pos);
++        return -1;
++    }
++
++    android_audio_ring_copy_out(slot, read_pos, packet, (uint32_t)sizeof(*packet));
++    total_bytes = (uint32_t)sizeof(*packet) + packet->payload_bytes;
++    if (packet->payload_bytes > payload_capacity ||
++        total_bytes > ANDROID_AUDIO_CAPTURE_RING_BYTES) {
++        android_audio_atomic_store_u64(&slot->read_pos, write_pos);
++        return -1;
++    }
++    if (available < total_bytes) return 0;
++
++    android_audio_ring_copy_out(slot, read_pos + sizeof(*packet), payload, packet->payload_bytes);
++    android_audio_atomic_store_u64(&slot->read_pos, read_pos + total_bytes);
++    return 1;
++}

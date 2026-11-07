@@ -1,0 +1,725 @@
+diff --git a/dlls/winebus.sys/bus_android.c b/dlls/winebus.sys/bus_android.c
+new file mode 100644
+index 00000000000..5556534f466
+--- /dev/null
++++ b/dlls/winebus.sys/bus_android.c
+@@ -0,0 +1,719 @@
++/*
++ * Plug and Play support for Android gamepads provided through shared memory.
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++#if 0
++#pragma makedep unix
++#endif
++
++#include "config.h"
++
++#include <errno.h>
++#include <fcntl.h>
++#include <limits.h>
++#include <pthread.h>
++#include <stddef.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++#include <sys/mman.h>
++#include <sys/stat.h>
++#include <sys/syscall.h>
++#ifdef __linux__
++# include <linux/futex.h>
++#endif
++
++#include "ntstatus.h"
++#define WIN32_NO_STATUS
++#include "windef.h"
++#include "winbase.h"
++#include "winternl.h"
++#include "ddk/hidtypes.h"
++#include "hidusage.h"
++
++#include "wine/debug.h"
++#include "wine/list.h"
++
++#include "unix_private.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(androidgamepad);
++
++#ifdef __linux__
++
++#define ANDROID_MAX_GAMEPADS 4
++#define ANDROID_SHM_SIZE 64
++
++/* Shared-memory ABI used by the Android gamepad producer. */
++struct android_gamepad_state
++{
++    int16_t lx, ly, rx, ry, lt, rt;
++    uint8_t buttons[15];
++    uint8_t hat;
++    uint16_t low_freq_rumble;
++    uint16_t high_freq_rumble;
++};
++
++struct android_gamepad_io
++{
++    uint32_t seq;
++    struct android_gamepad_state state;
++    uint32_t rumble_seq;
++    uint32_t connected;
++};
++
++struct android_input_snapshot
++{
++    uint32_t seq;
++    BOOL connected;
++    int16_t lx, ly, rx, ry, lt, rt;
++    uint8_t buttons[15];
++    uint8_t hat;
++};
++
++struct android_slot;
++
++struct android_device
++{
++    struct unix_device unix_device;
++    struct android_slot *slot;
++    BOOL started;
++};
++
++struct android_slot
++{
++    unsigned int index;
++    int fd;
++    struct android_gamepad_io *shm;
++    struct android_device *device;
++    pthread_t thread;
++    BOOL thread_started;
++    uint32_t last_seq;
++    BOOL last_connected;
++};
++
++C_ASSERT(sizeof(struct android_gamepad_state) == 32);
++C_ASSERT(offsetof(struct android_gamepad_io, seq) == 0);
++C_ASSERT(offsetof(struct android_gamepad_io, state) == 4);
++C_ASSERT(offsetof(struct android_gamepad_io, rumble_seq) == 36);
++C_ASSERT(offsetof(struct android_gamepad_io, connected) == 40);
++C_ASSERT(sizeof(struct android_gamepad_io) == 44);
++
++static pthread_mutex_t android_cs = PTHREAD_MUTEX_INITIALIZER;
++static pthread_cond_t android_cond = PTHREAD_COND_INITIALIZER;
++static struct list event_queue = LIST_INIT(event_queue);
++static struct android_slot slots[ANDROID_MAX_GAMEPADS];
++static BOOL android_initialized;
++static BOOL android_stopping;
++
++static inline struct android_device *impl_from_unix_device(struct unix_device *iface)
++{
++    return CONTAINING_RECORD(iface, struct android_device, unix_device);
++}
++
++static uint32_t atomic_load_u32(const uint32_t *value)
++{
++    return __atomic_load_n(value, __ATOMIC_ACQUIRE);
++}
++
++static uint32_t atomic_inc_u32(uint32_t *value)
++{
++    return __atomic_add_fetch(value, 1, __ATOMIC_RELEASE);
++}
++
++static void wake_rumble(struct android_slot *slot)
++{
++    atomic_inc_u32(&slot->shm->rumble_seq);
++    syscall(SYS_futex, &slot->shm->rumble_seq, FUTEX_WAKE, INT_MAX, NULL, NULL, 0);
++}
++
++static void set_rumble(struct android_slot *slot, uint16_t low, uint16_t high)
++{
++    if (!slot || !slot->shm) return;
++
++    slot->shm->state.low_freq_rumble = low;
++    slot->shm->state.high_freq_rumble = high;
++    __atomic_thread_fence(__ATOMIC_SEQ_CST);
++    wake_rumble(slot);
++}
++
++static LONG invert_y(int16_t value)
++{
++    return -(LONG)value - 1;
++}
++
++static LONG convert_trigger(int16_t value)
++{
++    LONG result = ((LONG)value + 32767) / 2;
++    if (result < 0) return 0;
++    if (result > 32767) return 32767;
++    return result;
++}
++
++static void apply_snapshot(struct android_device *impl, const struct android_input_snapshot *snapshot)
++{
++    static const int button_map[15] =
++    {
++        0,  /* A */
++        1,  /* B */
++        2,  /* X */
++        3,  /* Y */
++        6,  /* Back */
++        16, /* Guide */
++        7,  /* Start */
++        8,  /* Left stick */
++        9,  /* Right stick */
++        4,  /* Left shoulder */
++        5,  /* Right shoulder */
++        10, /* D-pad up */
++        12, /* D-pad down */
++        13, /* D-pad left */
++        11, /* D-pad right */
++    };
++    struct unix_device *iface = &impl->unix_device;
++    LONG hat_x = 0, hat_y = 0;
++    unsigned int i;
++
++    hid_device_set_abs_axis(iface, 0, snapshot->lx);
++    hid_device_set_abs_axis(iface, 1, invert_y(snapshot->ly));
++    hid_device_set_abs_axis(iface, 2, snapshot->rx);
++    hid_device_set_abs_axis(iface, 3, invert_y(snapshot->ry));
++    hid_device_set_abs_axis(iface, 4, convert_trigger(snapshot->lt));
++    hid_device_set_abs_axis(iface, 5, convert_trigger(snapshot->rt));
++
++    for (i = 0; i < ARRAY_SIZE(button_map); ++i)
++        hid_device_set_button(iface, button_map[i], !!snapshot->buttons[i]);
++
++    if (snapshot->buttons[13]) hat_x--;
++    if (snapshot->buttons[14]) hat_x++;
++    if (snapshot->buttons[11]) hat_y--;
++    if (snapshot->buttons[12]) hat_y++;
++
++    /* Fall back to the hat bitfield when the buttons give no direction. */
++    if (!hat_x && !hat_y && snapshot->hat)
++    {
++        if (snapshot->hat & 0x08) hat_x--;
++        if (snapshot->hat & 0x02) hat_x++;
++        if (snapshot->hat & 0x01) hat_y--;
++        if (snapshot->hat & 0x04) hat_y++;
++    }
++
++    if (hat_x < -1) hat_x = -1;
++    if (hat_x > 1) hat_x = 1;
++    if (hat_y < -1) hat_y = -1;
++    if (hat_y > 1) hat_y = 1;
++    hid_device_set_hatswitch_x(iface, 0, hat_x);
++    hid_device_set_hatswitch_y(iface, 0, hat_y);
++}
++
++static BOOL read_snapshot(struct android_slot *slot, struct android_input_snapshot *snapshot)
++{
++    unsigned int retry;
++
++    for (retry = 0; retry < 8; ++retry)
++    {
++        uint32_t seq1 = atomic_load_u32(&slot->shm->seq);
++
++        snapshot->lx = slot->shm->state.lx;
++        snapshot->ly = slot->shm->state.ly;
++        snapshot->rx = slot->shm->state.rx;
++        snapshot->ry = slot->shm->state.ry;
++        snapshot->lt = slot->shm->state.lt;
++        snapshot->rt = slot->shm->state.rt;
++        memcpy(snapshot->buttons, slot->shm->state.buttons, sizeof(snapshot->buttons));
++        snapshot->hat = slot->shm->state.hat;
++        snapshot->connected = atomic_load_u32(&slot->shm->connected) != 0;
++
++        if (atomic_load_u32(&slot->shm->seq) == seq1)
++        {
++            snapshot->seq = seq1;
++            return TRUE;
++        }
++    }
++
++    return FALSE;
++}
++
++static void fill_device_desc(unsigned int slot, struct device_desc *desc)
++{
++    memset(desc, 0, sizeof(*desc));
++    desc->vid = 0x045e;
++    desc->pid = 0x028e;
++    desc->version = 0;
++    desc->input = -1;
++    desc->uid = slot + 1;
++    desc->bus_type = BUS_TYPE_USB;
++    desc->is_gamepad = TRUE;
++    desc->is_hidraw = FALSE;
++
++    desc->manufacturer[0] = 'M';
++    desc->manufacturer[1] = 'i';
++    desc->manufacturer[2] = 'c';
++    desc->manufacturer[3] = 'r';
++    desc->manufacturer[4] = 'o';
++    desc->manufacturer[5] = 's';
++    desc->manufacturer[6] = 'o';
++    desc->manufacturer[7] = 'f';
++    desc->manufacturer[8] = 't';
++
++    desc->product[0] = 'X';
++    desc->product[1] = 'b';
++    desc->product[2] = 'o';
++    desc->product[3] = 'x';
++    desc->product[4] = ' ';
++    desc->product[5] = '3';
++    desc->product[6] = '6';
++    desc->product[7] = '0';
++    desc->product[8] = ' ';
++    desc->product[9] = 'C';
++    desc->product[10] = 'o';
++    desc->product[11] = 'n';
++    desc->product[12] = 't';
++    desc->product[13] = 'r';
++    desc->product[14] = 'o';
++    desc->product[15] = 'l';
++    desc->product[16] = 'l';
++    desc->product[17] = 'e';
++    desc->product[18] = 'r';
++
++    desc->serialnumber[0] = 'A';
++    desc->serialnumber[1] = 'N';
++    desc->serialnumber[2] = 'D';
++    desc->serialnumber[3] = 'R';
++    desc->serialnumber[4] = 'O';
++    desc->serialnumber[5] = 'I';
++    desc->serialnumber[6] = 'D';
++    desc->serialnumber[7] = '-';
++    desc->serialnumber[8] = 'P';
++    desc->serialnumber[9] = '1' + slot;
++}
++
++static void android_device_destroy(struct unix_device *iface)
++{
++    struct android_device *impl = impl_from_unix_device(iface);
++
++    if (!impl->slot) return;
++    pthread_mutex_lock(&android_cs);
++    if (impl->slot->device == impl) impl->slot->device = NULL;
++    pthread_mutex_unlock(&android_cs);
++}
++
++static NTSTATUS android_device_start(struct unix_device *iface)
++{
++    struct android_device *impl = impl_from_unix_device(iface);
++    struct hid_device_state *state = &iface->hid_device_state;
++
++    pthread_mutex_lock(&android_cs);
++    impl->started = TRUE;
++    if (!android_stopping &&
++        bus_event_queue_input_report(&event_queue, iface, state->report_buf, state->report_len))
++        pthread_cond_signal(&android_cond);
++    pthread_mutex_unlock(&android_cs);
++
++    TRACE("slot %u device %p started\n", impl->slot->index, impl);
++    return STATUS_SUCCESS;
++}
++
++static void android_device_stop(struct unix_device *iface)
++{
++    struct android_device *impl = impl_from_unix_device(iface);
++
++    pthread_mutex_lock(&android_cs);
++    impl->started = FALSE;
++    pthread_mutex_unlock(&android_cs);
++    TRACE("slot %u device %p stopped\n", impl->slot->index, impl);
++}
++
++static NTSTATUS android_device_haptics_start(struct unix_device *iface, UINT duration_ms,
++                                             USHORT rumble_intensity, USHORT buzz_intensity,
++                                             USHORT left_intensity, USHORT right_intensity)
++{
++    struct android_device *impl = impl_from_unix_device(iface);
++
++    (void)duration_ms;
++    (void)left_intensity;
++    (void)right_intensity;
++    set_rumble(impl->slot, rumble_intensity, buzz_intensity);
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS android_device_haptics_stop(struct unix_device *iface)
++{
++    struct android_device *impl = impl_from_unix_device(iface);
++    set_rumble(impl->slot, 0, 0);
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS android_device_physical_device_control(struct unix_device *iface, USAGE control)
++{
++    (void)iface;
++    (void)control;
++    return STATUS_NOT_SUPPORTED;
++}
++
++static NTSTATUS android_device_physical_device_set_gain(struct unix_device *iface, BYTE percent)
++{
++    (void)iface;
++    (void)percent;
++    return STATUS_NOT_SUPPORTED;
++}
++
++static NTSTATUS android_device_physical_effect_control(struct unix_device *iface, BYTE index,
++                                                        USAGE control, BYTE iterations)
++{
++    (void)iface;
++    (void)index;
++    (void)control;
++    (void)iterations;
++    return STATUS_NOT_SUPPORTED;
++}
++
++static NTSTATUS android_device_physical_effect_update(struct unix_device *iface, BYTE index,
++                                                       struct effect_params *params)
++{
++    (void)iface;
++    (void)index;
++    (void)params;
++    return STATUS_NOT_SUPPORTED;
++}
++
++static const struct hid_device_vtbl android_device_vtbl =
++{
++    android_device_destroy,
++    android_device_start,
++    android_device_stop,
++    android_device_haptics_start,
++    android_device_haptics_stop,
++    android_device_physical_device_control,
++    android_device_physical_device_set_gain,
++    android_device_physical_effect_control,
++    android_device_physical_effect_update,
++};
++
++static struct android_device *create_device(struct android_slot *slot,
++                                             const struct android_input_snapshot *snapshot)
++{
++    const USAGE_AND_PAGE device_usage =
++        {.UsagePage = HID_USAGE_PAGE_GENERIC, .Usage = HID_USAGE_GENERIC_GAMEPAD};
++    struct android_device *impl;
++
++    if (!(impl = hid_device_create(&android_device_vtbl, sizeof(*impl)))) return NULL;
++    impl->slot = slot;
++
++    if (!hid_device_begin_report_descriptor(&impl->unix_device, &device_usage) ||
++        !hid_device_add_gamepad(&impl->unix_device) ||
++        !hid_device_add_haptics(&impl->unix_device) ||
++        !hid_device_end_report_descriptor(&impl->unix_device))
++    {
++        /* The caller holds android_cs; destroy() would lock it again. */
++        impl->slot = NULL;
++        impl->unix_device.vtbl->destroy(&impl->unix_device);
++        free(impl);
++        return NULL;
++    }
++
++    apply_snapshot(impl, snapshot);
++    return impl;
++}
++
++static void destroy_unpublished_device_locked(struct android_slot *slot,
++                                                struct android_device *device)
++{
++    if (slot->device == device) slot->device = NULL;
++
++    /* The caller holds android_cs; skip the destructor's lock. */
++    device->slot = NULL;
++    device->unix_device.vtbl->destroy(&device->unix_device);
++    free(device);
++}
++
++static void process_snapshot_locked(struct android_slot *slot,
++                                    const struct android_input_snapshot *snapshot)
++{
++    struct device_desc desc;
++
++    slot->last_seq = snapshot->seq;
++
++    if (snapshot->connected != slot->last_connected)
++        TRACE("slot %u connected transition %u -> %u seq %u\n", slot->index,
++              slot->last_connected, snapshot->connected, snapshot->seq);
++    slot->last_connected = snapshot->connected;
++
++    /* Retry removal on later updates if queuing the event fails. */
++    if (!snapshot->connected && slot->device)
++    {
++        struct android_device *device = slot->device;
++
++        if (bus_event_queue_device_removed(&event_queue, &device->unix_device))
++        {
++            slot->device = NULL;
++            pthread_cond_signal(&android_cond);
++        }
++        else WARN("slot %u failed to queue device removal\n", slot->index);
++    }
++
++    /* The Wine device may disappear without a shared-memory disconnect. */
++    if (snapshot->connected && !slot->device)
++    {
++        struct android_device *device = create_device(slot, snapshot);
++
++        if (device)
++        {
++            slot->device = device;
++            fill_device_desc(slot->index, &desc);
++            if (bus_event_queue_device_created(&event_queue, &device->unix_device, &desc))
++                pthread_cond_signal(&android_cond);
++            else
++            {
++                WARN("slot %u failed to queue device creation\n", slot->index);
++                destroy_unpublished_device_locked(slot, device);
++            }
++        }
++    }
++
++    if (snapshot->connected && slot->device)
++    {
++        struct hid_device_state *state = &slot->device->unix_device.hid_device_state;
++        apply_snapshot(slot->device, snapshot);
++        if (slot->device->started &&
++            bus_event_queue_input_report(&event_queue, &slot->device->unix_device,
++                                         state->report_buf, state->report_len))
++            pthread_cond_signal(&android_cond);
++    }
++}
++
++static void *slot_thread(void *arg)
++{
++    struct android_slot *slot = arg;
++
++    for (;;)
++    {
++        struct android_input_snapshot snapshot;
++        uint32_t expected;
++
++        pthread_mutex_lock(&android_cs);
++        if (android_stopping)
++        {
++            pthread_mutex_unlock(&android_cs);
++            break;
++        }
++        expected = slot->last_seq;
++        pthread_mutex_unlock(&android_cs);
++
++        syscall(SYS_futex, &slot->shm->seq, FUTEX_WAIT, expected, NULL, NULL, 0);
++
++        pthread_mutex_lock(&android_cs);
++        if (android_stopping)
++        {
++            pthread_mutex_unlock(&android_cs);
++            break;
++        }
++        pthread_mutex_unlock(&android_cs);
++
++        if (!read_snapshot(slot, &snapshot)) continue;
++
++        pthread_mutex_lock(&android_cs);
++        if (!android_stopping && snapshot.seq != slot->last_seq)
++            process_snapshot_locked(slot, &snapshot);
++        pthread_mutex_unlock(&android_cs);
++    }
++
++    return NULL;
++}
++
++static const char *get_shm_dir(void)
++{
++    const char *dir = getenv("WINE_ANDROID_GAMEPAD_SHM_DIR");
++    return dir && *dir ? dir : NULL;
++}
++
++static BOOL map_slot(struct android_slot *slot, const char *dir, unsigned int index)
++{
++    char path[PATH_MAX];
++    struct stat st;
++
++    memset(slot, 0, sizeof(*slot));
++    slot->index = index;
++    slot->fd = -1;
++
++    if (index)
++        snprintf(path, sizeof(path), "%s/gamepad%u.mem", dir, index);
++    else
++        snprintf(path, sizeof(path), "%s/gamepad.mem", dir);
++
++    if ((slot->fd = open(path, O_RDWR | O_CLOEXEC)) < 0)
++    {
++        WARN("slot %u could not open %s: %s\n", index, path, strerror(errno));
++        return FALSE;
++    }
++    if (fstat(slot->fd, &st) || st.st_size < ANDROID_SHM_SIZE)
++    {
++        WARN("slot %u invalid shared-memory file %s\n", index, path);
++        close(slot->fd);
++        slot->fd = -1;
++        return FALSE;
++    }
++    if ((slot->shm = mmap(NULL, ANDROID_SHM_SIZE, PROT_READ | PROT_WRITE,
++                          MAP_SHARED, slot->fd, 0)) == MAP_FAILED)
++    {
++        WARN("slot %u mmap %s failed: %s\n", index, path, strerror(errno));
++        slot->shm = NULL;
++        close(slot->fd);
++        slot->fd = -1;
++        return FALSE;
++    }
++
++    close(slot->fd);
++    slot->fd = -1;
++    TRACE("slot %u mapped %s at %p\n", index, path, slot->shm);
++    return TRUE;
++}
++
++NTSTATUS android_bus_stop(void *args);
++
++NTSTATUS android_bus_init(void *args)
++{
++    const char *dir;
++    unsigned int i, mapped = 0;
++
++    (void)args;
++    if (!(dir = get_shm_dir())) return STATUS_NOT_SUPPORTED;
++
++    TRACE("starting Android shared-memory gamepad bus from %s\n", dir);
++
++    pthread_mutex_lock(&android_cs);
++    android_stopping = FALSE;
++    android_initialized = TRUE;
++    list_init(&event_queue);
++    pthread_mutex_unlock(&android_cs);
++
++    for (i = 0; i < ARRAY_SIZE(slots); ++i)
++    {
++        struct android_input_snapshot snapshot;
++
++        if (!map_slot(&slots[i], dir, i)) continue;
++        mapped++;
++
++        if (!read_snapshot(&slots[i], &snapshot))
++        {
++            WARN("slot %u could not obtain a stable initial snapshot\n", i);
++            snapshot.seq = atomic_load_u32(&slots[i].shm->seq);
++            snapshot.connected = atomic_load_u32(&slots[i].shm->connected) != 0;
++            snapshot.lx = snapshot.ly = snapshot.rx = snapshot.ry = 0;
++            snapshot.lt = snapshot.rt = -32767;
++            memset(snapshot.buttons, 0, sizeof(snapshot.buttons));
++            snapshot.hat = 0;
++        }
++
++        pthread_mutex_lock(&android_cs);
++        slots[i].last_seq = snapshot.seq;
++        slots[i].last_connected = FALSE;
++        process_snapshot_locked(&slots[i], &snapshot);
++        pthread_mutex_unlock(&android_cs);
++
++        if (!pthread_create(&slots[i].thread, NULL, slot_thread, &slots[i]))
++            slots[i].thread_started = TRUE;
++        else
++            WARN("slot %u failed to start shared-memory watcher\n", i);
++    }
++
++    if (!mapped)
++    {
++        WARN("no Android gamepad shared-memory slots were available\n");
++        pthread_mutex_lock(&android_cs);
++        android_stopping = TRUE;
++        android_initialized = FALSE;
++        pthread_mutex_unlock(&android_cs);
++        return STATUS_NOT_SUPPORTED;
++    }
++
++    return STATUS_SUCCESS;
++}
++
++NTSTATUS android_bus_wait(void *args)
++{
++    struct bus_event *result = args;
++    BOOL stopping;
++    unsigned int i;
++
++    bus_event_cleanup(result);
++
++    pthread_mutex_lock(&android_cs);
++    while (!android_stopping && !bus_event_queue_pop(&event_queue, result))
++        pthread_cond_wait(&android_cond, &android_cs);
++    stopping = android_stopping;
++    pthread_mutex_unlock(&android_cs);
++
++    if (!stopping) return STATUS_PENDING;
++
++    for (i = 0; i < ARRAY_SIZE(slots); ++i)
++    {
++        if (!slots[i].thread_started) continue;
++        pthread_join(slots[i].thread, NULL);
++        slots[i].thread_started = FALSE;
++    }
++
++    /* Queue cleanup can release a device and reacquire android_cs. */
++    bus_event_queue_destroy(&event_queue);
++
++    pthread_mutex_lock(&android_cs);
++    android_initialized = FALSE;
++    pthread_mutex_unlock(&android_cs);
++
++    TRACE("Android shared-memory gamepad bus exiting\n");
++    return STATUS_SUCCESS;
++}
++
++NTSTATUS android_bus_stop(void *args)
++{
++    unsigned int i;
++
++    (void)args;
++
++    pthread_mutex_lock(&android_cs);
++    if (!android_initialized)
++    {
++        pthread_mutex_unlock(&android_cs);
++        return STATUS_SUCCESS;
++    }
++    android_stopping = TRUE;
++    pthread_cond_broadcast(&android_cond);
++
++    /* Increment seq before wake to cover the stop-check/FUTEX_WAIT race. */
++    for (i = 0; i < ARRAY_SIZE(slots); ++i)
++    {
++        if (!slots[i].shm || !slots[i].thread_started) continue;
++        atomic_inc_u32(&slots[i].shm->seq);
++        syscall(SYS_futex, &slots[i].shm->seq, FUTEX_WAKE, 1, NULL, NULL, 0);
++    }
++
++    pthread_mutex_unlock(&android_cs);
++    return STATUS_SUCCESS;
++}
++
++#else /* __linux__ */
++
++NTSTATUS android_bus_init(void *args)
++{
++    (void)args;
++    return STATUS_NOT_SUPPORTED;
++}
++
++NTSTATUS android_bus_wait(void *args)
++{
++    (void)args;
++    return STATUS_NOT_SUPPORTED;
++}
++
++NTSTATUS android_bus_stop(void *args)
++{
++    (void)args;
++    return STATUS_SUCCESS;
++}
++
++#endif /* __linux__ */

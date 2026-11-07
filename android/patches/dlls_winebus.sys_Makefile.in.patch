@@ -1,0 +1,12 @@
+diff --git a/dlls/winebus.sys/Makefile.in b/dlls/winebus.sys/Makefile.in
+index db32faee5b3..11715af6507 100644
+--- a/dlls/winebus.sys/Makefile.in
++++ b/dlls/winebus.sys/Makefile.in
+@@ -7,6 +7,7 @@ UNIX_CFLAGS  = $(UDEV_CFLAGS) $(SDL2_CFLAGS)
+ EXTRADLLFLAGS = -Wl,--subsystem,native
+ 
+ SOURCES = \
++	bus_android.c \
+ 	bus_iohid.c \
+ 	bus_sdl.c \
+ 	bus_udev.c \

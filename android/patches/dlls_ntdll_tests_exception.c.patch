@@ -1,0 +1,80 @@
+diff --git a/dlls/ntdll/tests/exception.c b/dlls/ntdll/tests/exception.c
+index 9cdd253ca5c..100f19fb234 100644
+--- a/dlls/ntdll/tests/exception.c
++++ b/dlls/ntdll/tests/exception.c
+@@ -7689,6 +7689,67 @@ static void test_restore_context(void)
+ 
+ #elif defined(__aarch64__)
+ 
++static DWORD WINAPI cpsr_mask_test_thread( void *arg )
++{
++    WaitForSingleObject( (HANDLE)arg, INFINITE );
++    return 0;
++}
++
++static void test_arm64_cpsr_user_mask(void)
++{
++    CONTEXT original, context;
++    HANDLE event, thread;
++    NTSTATUS status;
++    DWORD suspend_count;
++
++    if (!pNtGetContextThread || !pNtSetContextThread) return;
++
++    event = CreateEventW( NULL, TRUE, FALSE, NULL );
++    ok( !!event, "CreateEventW failed: %lu\n", GetLastError() );
++    if (!event) return;
++
++    thread = CreateThread( NULL, 0, cpsr_mask_test_thread, event, 0, NULL );
++    ok( !!thread, "CreateThread failed: %lu\n", GetLastError() );
++    if (!thread)
++    {
++        CloseHandle( event );
++        return;
++    }
++
++    suspend_count = SuspendThread( thread );
++    ok( suspend_count != (DWORD)-1, "SuspendThread failed: %lu\n", GetLastError() );
++    if (suspend_count != (DWORD)-1)
++    {
++        original.ContextFlags = CONTEXT_ARM64_CONTROL;
++        status = pNtGetContextThread( thread, &original );
++        ok( !status, "NtGetContextThread failed %08lx\n", status );
++        if (!status)
++        {
++            context = original;
++            context.Cpsr = ~original.Cpsr;
++            status = pNtSetContextThread( thread, &context );
++            ok( !status, "NtSetContextThread failed %08lx\n", status );
++            if (!status)
++            {
++                context.ContextFlags = CONTEXT_ARM64_CONTROL;
++                status = pNtGetContextThread( thread, &context );
++                ok( !status, "NtGetContextThread failed %08lx\n", status );
++                if (!status)
++                    ok( (original.Cpsr ^ context.Cpsr) == 0xf620fc30,
++                        "unexpected cpsr modification = %lx\n", original.Cpsr ^ context.Cpsr );
++            }
++            status = pNtSetContextThread( thread, &original );
++            ok( !status, "NtSetContextThread failed %08lx\n", status );
++        }
++        ResumeThread( thread );
++    }
++
++    SetEvent( event );
++    WaitForSingleObject( thread, INFINITE );
++    CloseHandle( thread );
++    CloseHandle( event );
++}
++
+ static void test_thread_context(void)
+ {
+     CONTEXT context;
+@@ -7850,6 +7911,7 @@ static void test_thread_context(void)
+     ok( (char *)context.Pc >= (char *)pNtGetContextThread &&
+         (char *)context.Pc <= (char *)pNtGetContextThread + 32,
+         "wrong Pc %p/%p\n", (void *)context.Pc, pNtGetContextThread );
++    test_arm64_cpsr_user_mask();
+ #undef COMPARE
+ }
+ 

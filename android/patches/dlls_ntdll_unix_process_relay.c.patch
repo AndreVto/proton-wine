@@ -1,0 +1,205 @@
+diff --git a/dlls/ntdll/unix/process_relay.c b/dlls/ntdll/unix/process_relay.c
+new file mode 100644
+index 00000000000..bbd36e86cad
+--- /dev/null
++++ b/dlls/ntdll/unix/process_relay.c
+@@ -0,0 +1,199 @@
++/* Android Wine child-process relay. */
++
++#if 0
++#pragma makedep unix
++#endif
++
++#include "config.h"
++
++#include <errno.h>
++#include <fcntl.h>
++#include <stddef.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/socket.h>
++#include <sys/types.h>
++#include <sys/un.h>
++#include <unistd.h>
++
++#include "process_relay.h"
++
++extern char **environ;
++
++#define WINE_RELAY_MAGIC 0x57505231u /* WPR1 */
++#define WINE_RELAY_VERSION 1u
++#define WINE_RELAY_FLAG_NEW_SESSION 0x1u
++#define WINE_RELAY_FLAG_USE_PRELOADER 0x2u
++#define WINE_RELAY_MAX_PAYLOAD (1024u * 1024u)
++
++struct wine_relay_header
++{
++    uint32_t magic;
++    uint32_t version;
++    uint32_t flags;
++    uint32_t argc;
++    uint32_t envc;
++    uint32_t cwd_length;
++    uint32_t payload_length;
++};
++
++struct wine_relay_ack
++{
++    uint32_t magic;
++    int32_t status;
++    int32_t pid;
++};
++
++static int append_string( unsigned char *payload, size_t capacity, size_t *offset,
++                          const char *value )
++{
++    uint32_t length;
++    size_t size = value ? strlen( value ) : 0;
++    if (size > UINT32_MAX || *offset + sizeof(length) + size > capacity) return 0;
++    length = (uint32_t)size;
++    memcpy( payload + *offset, &length, sizeof(length) );
++    *offset += sizeof(length);
++    if (size) memcpy( payload + *offset, value, size );
++    *offset += size;
++    return 1;
++}
++
++int wine_process_relay( int argc, char *argv[] )
++{
++#if defined(__linux__)
++    const char *broker = getenv( "WINE_ANDROID_PROCESS_BROKER" );
++    const char *server_socket = getenv( "WINESERVERSOCKET" );
++    struct wine_relay_header header = {0};
++    struct wine_relay_ack ack = {0};
++    struct sockaddr_un address = {0};
++    struct msghdr message = {0};
++    struct cmsghdr *cmsg;
++    struct iovec iov[2];
++    unsigned char control[CMSG_SPACE(sizeof(int) * 4)] = {0};
++    unsigned char *payload = NULL;
++    char cwd[4096];
++    char *end;
++    long socket_value;
++    size_t payload_size, offset, broker_length;
++    unsigned int envc = 0, i;
++    int fds[4], fd = -1;
++    ssize_t sent;
++
++    if (!broker || !*broker) return 0;
++    if (!server_socket || !*server_socket) return -EINVAL;
++    if (argc <= 0 || !argv || !argv[0]) return -EINVAL;
++    if (!getcwd( cwd, sizeof(cwd) )) return -errno;
++    {
++        static const char unreachable_prefix[] = "(unreachable)";
++        const size_t prefix_length = sizeof(unreachable_prefix) - 1;
++
++        if (!strncmp( cwd, unreachable_prefix, prefix_length ) && cwd[prefix_length] == '/')
++            memmove( cwd, cwd + prefix_length, strlen(cwd + prefix_length) + 1 );
++    }
++
++    errno = 0;
++    socket_value = strtol( server_socket, &end, 10 );
++    if (errno || !end || *end || socket_value < 0 || socket_value > INT32_MAX) return -EINVAL;
++    for (; environ && environ[envc]; ++envc) if (envc == UINT32_MAX) return -E2BIG;
++
++    payload_size = strlen( cwd );
++    for (i = 0; i < (unsigned int)argc; ++i)
++    {
++        size_t len = strlen( argv[i] );
++        if (len > WINE_RELAY_MAX_PAYLOAD - sizeof(uint32_t) ||
++            payload_size > WINE_RELAY_MAX_PAYLOAD - sizeof(uint32_t) - len) return -E2BIG;
++        payload_size += sizeof(uint32_t) + len;
++    }
++    for (i = 0; i < envc; ++i)
++    {
++        size_t len = strlen( environ[i] );
++        if (len > WINE_RELAY_MAX_PAYLOAD - sizeof(uint32_t) ||
++            payload_size > WINE_RELAY_MAX_PAYLOAD - sizeof(uint32_t) - len) return -E2BIG;
++        payload_size += sizeof(uint32_t) + len;
++    }
++    if (payload_size > WINE_RELAY_MAX_PAYLOAD) return -E2BIG;
++
++    if (!(payload = malloc( payload_size ? payload_size : 1 ))) return -ENOMEM;
++    offset = 0;
++    memcpy( payload, cwd, strlen(cwd) );
++    offset += strlen(cwd);
++    for (i = 0; i < (unsigned int)argc; ++i)
++        if (!append_string( payload, payload_size, &offset, argv[i] )) goto invalid;
++    for (i = 0; i < envc; ++i)
++        if (!append_string( payload, payload_size, &offset, environ[i] )) goto invalid;
++
++    header.magic = WINE_RELAY_MAGIC;
++    header.version = WINE_RELAY_VERSION;
++    header.flags = getsid( 0 ) == getpid() ? WINE_RELAY_FLAG_NEW_SESSION : 0;
++    {
++        size_t loader_len = strlen( argv[0] );
++        char *preloader = malloc( loader_len + sizeof("-preloader") );
++        if (preloader)
++        {
++            memcpy( preloader, argv[0], loader_len );
++            memcpy( preloader + loader_len, "-preloader", sizeof("-preloader") );
++            if (!access( preloader, X_OK )) header.flags |= WINE_RELAY_FLAG_USE_PRELOADER;
++            free( preloader );
++        }
++    }
++    header.argc = (uint32_t)argc;
++    header.envc = envc;
++    header.cwd_length = (uint32_t)strlen( cwd );
++    header.payload_length = (uint32_t)payload_size;
++
++    broker_length = strlen( broker );
++    if (!broker_length || broker_length + 1 > sizeof(address.sun_path)) goto invalid;
++    if ((fd = socket( AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0 )) < 0) goto system_error;
++    address.sun_family = AF_UNIX;
++    address.sun_path[0] = 0;
++    memcpy( address.sun_path + 1, broker, broker_length );
++    if (connect( fd, (struct sockaddr *)&address,
++                 offsetof(struct sockaddr_un, sun_path) + 1 + broker_length ) < 0) goto system_error;
++
++    fds[0] = (int)socket_value;
++    fds[1] = STDIN_FILENO;
++    fds[2] = STDOUT_FILENO;
++    fds[3] = STDERR_FILENO;
++    iov[0].iov_base = &header;
++    iov[0].iov_len = sizeof(header);
++    iov[1].iov_base = payload;
++    iov[1].iov_len = payload_size;
++    message.msg_iov = iov;
++    message.msg_iovlen = 2;
++    message.msg_control = control;
++    message.msg_controllen = sizeof(control);
++    cmsg = CMSG_FIRSTHDR( &message );
++    cmsg->cmsg_level = SOL_SOCKET;
++    cmsg->cmsg_type = SCM_RIGHTS;
++    cmsg->cmsg_len = CMSG_LEN(sizeof(fds));
++    memcpy( CMSG_DATA(cmsg), fds, sizeof(fds) );
++    message.msg_controllen = CMSG_SPACE(sizeof(fds));
++
++    sent = sendmsg( fd, &message, MSG_NOSIGNAL );
++    if (sent != (ssize_t)(sizeof(header) + payload_size)) goto system_error;
++    if (recv( fd, &ack, sizeof(ack), MSG_WAITALL ) != sizeof(ack)) goto system_error;
++    close( fd );
++    free( payload );
++    if (ack.magic != WINE_RELAY_MAGIC) return -EPROTO;
++    if (ack.status) return ack.status;
++    return 1;
++
++invalid:
++    free( payload );
++    if (fd >= 0) close( fd );
++    return -EINVAL;
++system_error:
++    {
++        int error = errno ? -errno : -EIO;
++        free( payload );
++        if (fd >= 0) close( fd );
++        return error;
++    }
++#else
++    (void)argc;
++    (void)argv;
++    return 0;
++#endif
++}

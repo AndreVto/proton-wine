@@ -1,0 +1,546 @@
+diff --git a/server/fsync.c b/server/fsync.c
+index 7d3ec646f9e..ec6a2ee5842 100644
+--- a/server/fsync.c
++++ b/server/fsync.c
+@@ -28,6 +28,11 @@
+ #include <stdarg.h>
+ #include <sys/mman.h>
+ #include <stdint.h>
++#ifdef __ANDROID__
++#include <dirent.h>
++#include <sys/ioctl.h>
++#include <linux/futex.h>
++#endif
+ #ifdef HAVE_SYS_STAT_H
+ # include <sys/stat.h>
+ #endif
+@@ -52,11 +57,145 @@
+ #define __NR_futex_waitv 449
+ #endif
+ 
++#ifdef __ANDROID__
++#include "../android/shm_utils/shm_utils.h"
++#endif
++
+ int do_fsync_cached = -1;
+ 
++#ifdef __ANDROID__
++#define FSYNC_SHM_ENTRY_SIZE 32
++#define DRM_CAP_SYNCOBJ 0x13
++#define DRM_CAP_SYNCOBJ_TIMELINE 0x14
++
++struct drmsync_get_cap { uint64_t capability, value; };
++struct drmsync_create { uint32_t handle, flags; };
++struct drmsync_destroy { uint32_t handle, pad; };
++struct drmsync_handle { uint32_t handle, flags; int32_t fd; uint32_t pad; };
++_Static_assert( sizeof(struct drmsync_handle) == 16, "legacy DRM syncobj handle layout" );
++struct drmsync_timeline_array { uint64_t handles, points; uint32_t count_handles, flags; };
++
++#define DRMSYNC_IOCTL_GET_CAP _IOWR('d', 0x0c, struct drmsync_get_cap)
++#define DRMSYNC_IOCTL_CREATE _IOWR('d', 0xbf, struct drmsync_create)
++#define DRMSYNC_IOCTL_DESTROY _IOWR('d', 0xc0, struct drmsync_destroy)
++#define DRMSYNC_IOCTL_HANDLE_TO_FD _IOWR('d', 0xc1, struct drmsync_handle)
++#define DRMSYNC_IOCTL_QUERY _IOWR('d', 0xcb, struct drmsync_timeline_array)
++#define DRMSYNC_IOCTL_TIMELINE_SIGNAL _IOWR('d', 0xcd, struct drmsync_timeline_array)
++
++#ifndef FUTEX_TID_MASK
++#define FUTEX_TID_MASK 0x3fffffff
++#endif
++#ifndef FUTEX_OWNER_DIED
++#define FUTEX_OWNER_DIED 0x40000000
++#endif
++#ifndef FUTEX_WAITERS
++#define FUTEX_WAITERS 0x80000000
++#endif
++
++#define DRMSYNC_META_ACTIVE 0x00000001u
++
++struct drmsync_meta
++{
++    uint64_t seq;
++    uint32_t pi_futex;
++    uint32_t flags;
++};
++
++_Static_assert( sizeof(struct drmsync_meta) == 16, "drmsync metadata layout" );
++
++static int drmsync_fd = -1;
++static int drmsync_lf_enabled;
++static uint32_t *drmsync_handles;
++static size_t drmsync_handles_count;
++
++static uint32_t drmsync_native_tid(void)
++{
++    return (uint32_t)gettid() & FUTEX_TID_MASK;
++}
++
++static int drmsync_ioctl_retry( int fd, unsigned long request, void *arg )
++{
++    int ret;
++
++    do ret = ioctl( fd, request, arg );
++    while (ret == -1 && (errno == EINTR || errno == EAGAIN));
++    return ret;
++}
++
++static int drmsync_caps_ok( int fd )
++{
++    struct drmsync_get_cap cap;
++
++    memset( &cap, 0, sizeof(cap) );
++    cap.capability = DRM_CAP_SYNCOBJ;
++    if (drmsync_ioctl_retry( fd, DRMSYNC_IOCTL_GET_CAP, &cap ) == -1 || !cap.value) return 0;
++    memset( &cap, 0, sizeof(cap) );
++    cap.capability = DRM_CAP_SYNCOBJ_TIMELINE;
++    if (drmsync_ioctl_retry( fd, DRMSYNC_IOCTL_GET_CAP, &cap ) == -1 || !cap.value) return 0;
++    return 1;
++}
++
++static int drmsync_open_device(void)
++{
++    struct dirent *entry;
++    unsigned long best_minor = ULONG_MAX;
++    DIR *dir;
++    int best_fd = -1;
++
++    if (!(dir = opendir( "/dev/dri" ))) return -1;
++
++    while ((entry = readdir( dir )))
++    {
++        const char *suffix;
++        unsigned long minor;
++        char *end;
++        char path[PATH_MAX];
++        int fd, len;
++
++        if (strncmp( entry->d_name, "renderD", 7 )) continue;
++        suffix = entry->d_name + 7;
++        if (!*suffix) continue;
++
++        errno = 0;
++        minor = strtoul( suffix, &end, 10 );
++        if (errno || *end || minor < 128 || minor >= best_minor) continue;
++
++        len = snprintf( path, sizeof(path), "/dev/dri/%s", entry->d_name );
++        if (len < 0 || (size_t)len >= sizeof(path)) continue;
++
++        if ((fd = open( path, O_RDWR | O_CLOEXEC )) == -1) continue;
++        if (!drmsync_caps_ok( fd ))
++        {
++            close( fd );
++            continue;
++        }
++
++        if (best_fd >= 0) close( best_fd );
++        best_fd = fd;
++        best_minor = minor;
++    }
++
++    closedir( dir );
++    return best_fd;
++}
++
++static int drmsync_probe_support(void)
++{
++    int fd;
++
++    if ((fd = drmsync_open_device()) == -1) return 0;
++    close( fd );
++    return 1;
++}
++#else
++#define FSYNC_SHM_ENTRY_SIZE 16
++#endif
++
+ int fsync_check_support(void)
+ {
+-#ifdef __linux__
++#if defined(__ANDROID__)
++    return getenv( "WINEFSYNC" ) && atoi(getenv( "WINEFSYNC" )) && drmsync_probe_support();
++#elif defined(__linux__)
+     syscall( __NR_futex_waitv, 0, 0, 0, 0, 0 );
+     return getenv( "WINEFSYNC" ) && atoi(getenv( "WINEFSYNC" )) && errno != ENOSYS && errno != EPERM;
+ #else
+@@ -80,6 +219,9 @@ static uint32_t shm_idx_free_search_start_hint;
+ 
+ static void shm_cleanup(void)
+ {
++#ifdef __ANDROID__
++    if (drmsync_fd >= 0) close( drmsync_fd );
++#endif
+     close( shm_fd );
+     if (shm_unlink( shm_name ) == -1)
+         perror( "shm_unlink" );
+@@ -111,6 +253,12 @@ void fsync_init(void)
+     if (ftruncate( shm_fd, shm_size ) == -1)
+         perror( "ftruncate" );
+ 
++#ifdef __ANDROID__
++    drmsync_lf_enabled = getenv( "WINEFSYNC_LF" ) && atoi( getenv( "WINEFSYNC_LF" ) );
++    if ((drmsync_fd = drmsync_open_device()) == -1)
++        fatal_error( "fsync: no capable DRM render node available in wineserver\n" );
++#endif
++
+     is_fsync_initialized = 1;
+ 
+     fprintf( stderr, "fsync: up and running.\n" );
+@@ -135,8 +283,8 @@ struct fsync
+ 
+ static void *get_shm( unsigned int idx )
+ {
+-    int entry  = (idx * 16) / FSYNC_SHM_PAGE_SIZE;
+-    int offset = (idx * 16) % FSYNC_SHM_PAGE_SIZE;
++    int entry  = (idx * FSYNC_SHM_ENTRY_SIZE) / FSYNC_SHM_PAGE_SIZE;
++    int offset = (idx * FSYNC_SHM_ENTRY_SIZE) % FSYNC_SHM_PAGE_SIZE;
+ 
+     if (entry >= shm_addrs_size)
+     {
+@@ -154,12 +302,9 @@ static void *get_shm( unsigned int idx )
+     {
+         void *addr = mmap( NULL, FSYNC_SHM_PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd,
+                           (off_t)entry * FSYNC_SHM_PAGE_SIZE );
+-        if (addr == (void *)-1)
+-        {
+-            fprintf( stderr, "fsync: failed to map page %d (offset %#zx): ",
+-                     entry, (size_t)entry * FSYNC_SHM_PAGE_SIZE );
+-            perror( "mmap" );
+-        }
++        if (addr == MAP_FAILED)
++            fatal_error( "fsync: failed to map page %d (offset %#zx): %s\n",
++                         entry, (size_t)entry * FSYNC_SHM_PAGE_SIZE, strerror(errno) );
+ 
+         if (debug_level)
+             fprintf( stderr, "fsync: Mapping page %d at %p.\n", entry, addr );
+@@ -171,6 +316,226 @@ static void *get_shm( unsigned int idx )
+     return (void *)((unsigned long)shm_addrs[entry] + offset);
+ }
+ 
++#ifdef __ANDROID__
++struct drmsync_publish
++{
++    struct drmsync_meta *meta;
++    uint32_t handle;
++    uint32_t tid;
++    uint64_t point;
++    unsigned int shm_idx;
++    int locked;
++    int lock_free;
++    int notify;
++};
++
++static struct drmsync_meta *drmsync_meta_from_shm( void *shm )
++{
++    return (struct drmsync_meta *)((char *)shm + 16);
++}
++
++static void drmsync_ensure_handle_slot( unsigned int idx )
++{
++    size_t count;
++    uint32_t *new_handles;
++
++    if (idx < drmsync_handles_count) return;
++    count = drmsync_handles_count ? drmsync_handles_count : 16384;
++    while (count <= idx) count *= 2;
++    if (!(new_handles = realloc( drmsync_handles, count * sizeof(*new_handles) )))
++        fatal_error( "fsync: unable to grow DRM syncobj table\n" );
++    memset( new_handles + drmsync_handles_count, 0,
++            (count - drmsync_handles_count) * sizeof(*new_handles) );
++    drmsync_handles = new_handles;
++    drmsync_handles_count = count;
++}
++
++static uint32_t drmsync_create_syncobj(void)
++{
++    struct drmsync_create create = {0};
++    if (drmsync_ioctl_retry( drmsync_fd, DRMSYNC_IOCTL_CREATE, &create ) == -1)
++        fatal_error( "fsync: DRM_IOCTL_SYNCOBJ_CREATE failed: %s\n", strerror(errno) );
++    return create.handle;
++}
++
++static void drmsync_destroy_syncobj( uint32_t handle )
++{
++    struct drmsync_destroy destroy = { handle, 0 };
++    if (handle && drmsync_ioctl_retry( drmsync_fd, DRMSYNC_IOCTL_DESTROY, &destroy ) == -1)
++        fprintf( stderr, "fsync: DRM syncobj destroy failed for %u: %s\n", handle, strerror(errno) );
++}
++
++static int drmsync_pi_lock( uint32_t *word, uint32_t tid, int *owner_died )
++{
++    for (;;)
++    {
++        uint32_t expected = 0;
++        if (__atomic_compare_exchange_n( word, &expected, tid, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED ))
++        {
++            *owner_died = 0;
++            return 0;
++        }
++
++        if (!syscall( __NR_futex, word, FUTEX_LOCK_PI, 0, NULL, NULL, 0 ))
++        {
++            uint32_t state = __atomic_load_n( word, __ATOMIC_ACQUIRE );
++            *owner_died = !!(state & FUTEX_OWNER_DIED);
++            return 0;
++        }
++
++        if (errno == EINTR || errno == EAGAIN) continue;
++
++        if (errno == ESRCH)
++        {
++            /* ESRCH can mean a dead owner left a stale TID without kernel PI state.
++             * Do not clear it: TID reuse makes ownership impossible to verify. */
++            return -1;
++        }
++        return -1;
++    }
++}
++
++static int drmsync_pi_unlock( uint32_t *word, uint32_t tid )
++{
++    uint32_t expected = tid;
++
++    if (__atomic_compare_exchange_n( word, &expected, 0, 0, __ATOMIC_RELEASE, __ATOMIC_RELAXED )) return 0;
++    return syscall( __NR_futex, word, FUTEX_UNLOCK_PI, 0, NULL, NULL, 0 );
++}
++
++static uint64_t drmsync_query_point( uint32_t handle )
++{
++    struct drmsync_timeline_array query;
++    uint64_t point = 0;
++
++    memset( &query, 0, sizeof(query) );
++    query.handles = (uintptr_t)&handle;
++    query.points = (uintptr_t)&point;
++    query.count_handles = 1;
++    if (drmsync_ioctl_retry( drmsync_fd, DRMSYNC_IOCTL_QUERY, &query ) == -1)
++        fatal_error( "fsync: DRM_IOCTL_SYNCOBJ_QUERY failed: %s\n", strerror(errno) );
++    return point;
++}
++
++static uint32_t drmsync_get_or_create_syncobj( unsigned int shm_idx )
++{
++    struct drmsync_meta *meta;
++    uint32_t handle, tid = drmsync_native_tid();
++    int owner_died;
++
++    meta = drmsync_meta_from_shm( get_shm( shm_idx ) );
++    if (drmsync_pi_lock( &meta->pi_futex, tid, &owner_died ) == -1)
++        fatal_error( "fsync: FUTEX_LOCK_PI failed creating DRM syncobj: %s\n", strerror(errno) );
++
++    drmsync_ensure_handle_slot( shm_idx );
++    handle = drmsync_handles[shm_idx];
++    if (owner_died)
++        __atomic_store_n( &meta->seq, handle ? drmsync_query_point( handle ) : 0, __ATOMIC_SEQ_CST );
++    if (!handle)
++    {
++        if (__atomic_load_n( &meta->flags, __ATOMIC_RELAXED ) & DRMSYNC_META_ACTIVE)
++            fatal_error( "fsync: active DRM metadata without syncobj for shm index %u\n", shm_idx );
++        handle = drmsync_handles[shm_idx] = drmsync_create_syncobj();
++    }
++
++    if (drmsync_pi_unlock( &meta->pi_futex, tid ) == -1)
++        fatal_error( "fsync: FUTEX_UNLOCK_PI failed creating DRM syncobj: %s\n", strerror(errno) );
++    return handle;
++}
++
++int fsync_drm_export_fd( unsigned int shm_idx )
++{
++    struct drmsync_handle args = {0};
++
++    args.handle = drmsync_get_or_create_syncobj( shm_idx );
++    if (drmsync_ioctl_retry( drmsync_fd, DRMSYNC_IOCTL_HANDLE_TO_FD, &args ) == -1) return -1;
++    return args.fd;
++}
++
++static void drmsync_signal_point( uint32_t handle, uint64_t point )
++{
++    struct drmsync_timeline_array signal;
++
++    memset( &signal, 0, sizeof(signal) );
++    signal.handles = (uintptr_t)&handle;
++    signal.points = (uintptr_t)&point;
++    signal.count_handles = 1;
++    if (drmsync_ioctl_retry( drmsync_fd, DRMSYNC_IOCTL_TIMELINE_SIGNAL, &signal ) == -1)
++        fatal_error( "fsync: DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL failed: %s\n", strerror(errno) );
++}
++
++static void drmsync_publish_recover( struct drmsync_publish *publish )
++{
++    __atomic_store_n( &publish->meta->seq,
++                      publish->handle ? drmsync_query_point( publish->handle ) : 0,
++                      __ATOMIC_SEQ_CST );
++}
++
++static void drmsync_publish_lock( unsigned int shm_idx, struct drmsync_publish *publish )
++{
++    int owner_died;
++
++    memset( publish, 0, sizeof(*publish) );
++    publish->meta = drmsync_meta_from_shm( get_shm( shm_idx ) );
++    publish->tid = drmsync_native_tid();
++    publish->shm_idx = shm_idx;
++
++    if (drmsync_lf_enabled && !(__atomic_load_n( &publish->meta->flags, __ATOMIC_ACQUIRE ) & DRMSYNC_META_ACTIVE))
++    {
++        publish->lock_free = 1;
++        return;
++    }
++
++    if (drmsync_pi_lock( &publish->meta->pi_futex, publish->tid, &owner_died ) == -1)
++        fatal_error( "fsync: FUTEX_LOCK_PI failed: %s\n", strerror(errno) );
++    publish->locked = 1;
++    if (shm_idx < drmsync_handles_count) publish->handle = drmsync_handles[shm_idx];
++    if (owner_died) drmsync_publish_recover( publish );
++}
++
++static void drmsync_publish_signal( struct drmsync_publish *publish )
++{
++    uint32_t flags;
++
++    publish->notify = 1;
++    if (publish->lock_free) return;
++    flags = __atomic_load_n( &publish->meta->flags, __ATOMIC_RELAXED );
++    if (!(flags & DRMSYNC_META_ACTIVE)) return;
++    if (!publish->handle)
++        fatal_error( "fsync: active DRM metadata has no server syncobj\n" );
++    publish->point = __atomic_load_n( &publish->meta->seq, __ATOMIC_SEQ_CST ) + 1;
++    drmsync_signal_point( publish->handle, publish->point );
++}
++
++static void drmsync_publish_unlock( struct drmsync_publish *publish )
++{
++    if (publish->lock_free && publish->notify)
++    {
++        int owner_died;
++
++        __atomic_thread_fence( __ATOMIC_SEQ_CST );
++        /* A waiter may activate DRM notification during the lock-free update. */
++        if (!(__atomic_load_n( &publish->meta->flags, __ATOMIC_ACQUIRE ) & DRMSYNC_META_ACTIVE))
++            goto done;
++        if (drmsync_pi_lock( &publish->meta->pi_futex, publish->tid, &owner_died ) == -1)
++            fatal_error( "fsync: FUTEX_LOCK_PI failed: %s\n", strerror(errno) );
++        publish->locked = 1;
++        if (publish->shm_idx < drmsync_handles_count) publish->handle = drmsync_handles[publish->shm_idx];
++        if (owner_died) drmsync_publish_recover( publish );
++        if (!publish->handle)
++            fatal_error( "fsync: active DRM metadata has no server syncobj\n" );
++        publish->point = __atomic_load_n( &publish->meta->seq, __ATOMIC_SEQ_CST ) + 1;
++        drmsync_signal_point( publish->handle, publish->point );
++    }
++
++done:
++    if (publish->point)
++        __atomic_store_n( &publish->meta->seq, publish->point, __ATOMIC_SEQ_CST );
++    if (publish->locked && drmsync_pi_unlock( &publish->meta->pi_futex, publish->tid ) == -1)
++        fatal_error( "fsync: FUTEX_UNLOCK_PI failed: %s\n", strerror(errno) );
++}
++#endif
++
+ static int alloc_shm_idx_from_word( unsigned int word_index )
+ {
+     int ret;
+@@ -187,7 +552,7 @@ unsigned int fsync_alloc_shm( int low, int high )
+ {
+ #ifdef __linux__
+     unsigned int i;
+-    int shm_idx;
++    int shm_idx = 0;
+     int *shm;
+ 
+     /* this is arguably a bit of a hack, but we need some way to prevent
+@@ -219,7 +584,7 @@ unsigned int fsync_alloc_shm( int low, int high )
+         shm_idx = alloc_shm_idx_from_word( old_size );
+     }
+ 
+-    while (shm_idx * 16 >= shm_size)
++    while (shm_idx * FSYNC_SHM_ENTRY_SIZE >= shm_size)
+     {
+         /* Better expand the shm section. */
+         shm_size += FSYNC_SHM_PAGE_SIZE;
+@@ -237,6 +602,9 @@ unsigned int fsync_alloc_shm( int low, int high )
+     shm[1] = high;
+     shm[2] = 1; /* Reference count. */
+     shm[3] = 0; /* Last reference process id. */
++#ifdef __ANDROID__
++    memset( drmsync_meta_from_shm( shm ), 0, sizeof(struct drmsync_meta) );
++#endif
+ 
+     return shm_idx;
+ #else
+@@ -266,6 +634,14 @@ void fsync_free_shm_idx( int shm_idx )
+         return;
+     }
+ 
++#ifdef __ANDROID__
++    if ((unsigned int)shm_idx < drmsync_handles_count)
++    {
++        drmsync_destroy_syncobj( drmsync_handles[shm_idx] );
++        drmsync_handles[shm_idx] = 0;
++    }
++#endif
++
+     idx = shm_idx / BITS_IN_FREE_MAP_WORD;
+     mask = (uint64_t)1 << (shm_idx % BITS_IN_FREE_MAP_WORD);
+     assert( !(shm_idx_free_map[idx] & mask) );
+@@ -291,7 +667,7 @@ void fsync_cleanup_process_shm_indices( process_id_t id )
+         shmbase = get_shm( i * BITS_IN_FREE_MAP_WORD );
+         for (j = !i; j < BITS_IN_FREE_MAP_WORD; ++j)
+         {
+-            shm = (int *)((char *)shmbase + j * 16);
++            shm = (int *)((char *)shmbase + j * FSYNC_SHM_ENTRY_SIZE);
+             if (!(free_word & ((uint64_t)1 << j)) && shm[3] == id
+                   && __atomic_load_n( &shm[2], __ATOMIC_SEQ_CST ) == 1)
+                 fsync_free_shm_idx( i * BITS_IN_FREE_MAP_WORD + j );
+@@ -325,9 +701,21 @@ struct fsync_event
+ void fsync_set_event( unsigned int shm_idx )
+ {
+     struct fsync_event *event = get_shm( shm_idx );
++#ifdef __ANDROID__
++    struct drmsync_publish publish;
+ 
++    drmsync_publish_lock( shm_idx, &publish );
++    if (!__atomic_load_n( &event->signaled, __ATOMIC_SEQ_CST ))
++    {
++        drmsync_publish_signal( &publish );
++        __atomic_store_n( &event->signaled, 1, __ATOMIC_SEQ_CST );
++        futex_wake( &event->signaled, INT_MAX );
++    }
++    drmsync_publish_unlock( &publish );
++#else
+     if (!__atomic_exchange_n( &event->signaled, 1, __ATOMIC_SEQ_CST ))
+         futex_wake( &event->signaled, INT_MAX );
++#endif
+ }
+ 
+ void fsync_reset_event( unsigned int shm_idx )
+@@ -346,15 +734,29 @@ struct mutex
+ void fsync_abandon_mutex( unsigned int shm_idx, thread_id_t tid )
+ {
+     struct mutex *mutex = get_shm( shm_idx );
++#ifdef __ANDROID__
++    struct drmsync_publish publish;
+ 
++    drmsync_publish_lock( shm_idx, &publish );
++    if (mutex->tid == tid)
++    {
++        if (debug_level) fprintf( stderr, "fsync_abandon_mutexes() idx=%d\n", shm_idx );
++        drmsync_publish_signal( &publish );
++        __atomic_store_n( &mutex->count, 0, __ATOMIC_RELAXED );
++        __atomic_store_n( &mutex->tid, ~0, __ATOMIC_RELEASE );
++        futex_wake( &mutex->tid, INT_MAX );
++    }
++    drmsync_publish_unlock( &publish );
++#else
+     if (mutex->tid != tid) return;
+ 
+     if (debug_level)
+         fprintf( stderr, "fsync_abandon_mutexes() idx=%d\n", shm_idx );
+ 
+-    mutex->tid = ~0;
+-    mutex->count = 0;
++    __atomic_store_n( &mutex->count, 0, __ATOMIC_RELAXED );
++    __atomic_store_n( &mutex->tid, ~0, __ATOMIC_RELEASE );
+     futex_wake( &mutex->tid, INT_MAX );
++#endif
+ }
+ 
+ DECL_HANDLER(fsync_free_shm_idx)

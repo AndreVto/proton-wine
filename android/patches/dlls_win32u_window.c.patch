@@ -1,0 +1,107 @@
+diff --git a/dlls/win32u/window.c b/dlls/win32u/window.c
+index 8f65c43fb2f..360bb160ec2 100644
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -274,6 +274,70 @@ void *free_user_handle( HANDLE handle, unsigned short type )
+ static pthread_mutex_t surfaces_lock = PTHREAD_MUTEX_INITIALIZER;
+ static struct list client_surfaces = LIST_INIT( client_surfaces );
+ 
++static BOOL get_client_surface_geometry( struct client_surface *surface, LONG *width, LONG *height,
++                                         UINT *dpi, HWND *toplevel )
++{
++    RECT rect;
++
++    if (!surface->hwnd) return FALSE;
++
++    *dpi = NtUserGetDpiForWindow( surface->hwnd );
++    *toplevel = NtUserGetAncestor( surface->hwnd, GA_ROOT );
++
++    if (!NtUserGetPresentRect( surface->hwnd, &rect, *dpi ) &&
++        !NtUserGetClientRect( surface->hwnd, &rect, *dpi ))
++        return FALSE;
++
++    *width = rect.right - rect.left;
++    *height = rect.bottom - rect.top;
++    return TRUE;
++}
++
++static void init_client_surface_geometry( struct client_surface *surface )
++{
++    LONG width = 0, height = 0;
++    UINT dpi = 0;
++    HWND toplevel = 0;
++
++    get_client_surface_geometry( surface, &width, &height, &dpi, &toplevel );
++
++    surface->geometry_width = width;
++    surface->geometry_height = height;
++    surface->geometry_dpi = dpi;
++    surface->geometry_toplevel = toplevel;
++    surface->geometry_serial = 1;
++}
++
++static void refresh_client_surface_geometry( struct client_surface *surface )
++{
++    LONG width = 0, height = 0;
++    UINT dpi = 0;
++    HWND toplevel = 0;
++
++    get_client_surface_geometry( surface, &width, &height, &dpi, &toplevel );
++
++    if (surface->geometry_width == width &&
++        surface->geometry_height == height &&
++        surface->geometry_dpi == dpi &&
++        surface->geometry_toplevel == toplevel)
++        return;
++
++    surface->geometry_width = width;
++    surface->geometry_height = height;
++    surface->geometry_dpi = dpi;
++    surface->geometry_toplevel = toplevel;
++    InterlockedIncrement( &surface->geometry_serial );
++}
++
++static void invalidate_client_surface_geometry( struct client_surface *surface )
++{
++    surface->geometry_width = 0;
++    surface->geometry_height = 0;
++    surface->geometry_dpi = 0;
++    surface->geometry_toplevel = 0;
++    InterlockedIncrement( &surface->geometry_serial );
++}
++
+ void detach_client_surfaces( HWND hwnd )
+ {
+     struct list detached = LIST_INIT( detached );
+@@ -290,6 +354,7 @@ void detach_client_surfaces( HWND hwnd )
+         client_surface_add_ref( surface );
+ 
+         surface->funcs->detach( surface );
++        invalidate_client_surface_geometry( surface );
+         surface->hwnd = NULL;
+     }
+ 
+@@ -312,6 +377,7 @@ static void update_client_surfaces( HWND hwnd )
+     {
+         if (NtUserGetAncestor( surface->hwnd, GA_ROOT ) != hwnd) continue;
+         surface->funcs->update( surface );
++        refresh_client_surface_geometry( surface );
+         InterlockedExchange( &surface->updated, 1 );
+     }
+ 
+@@ -326,6 +392,7 @@ void *client_surface_create( UINT size, const struct client_surface_funcs *funcs
+     surface->funcs = funcs;
+     surface->ref = 1;
+     surface->hwnd = hwnd;
++    init_client_surface_geometry( surface );
+     list_init( &surface->entry );
+ 
+     TRACE( "created %s\n", debugstr_client_surface( surface ) );
+@@ -387,6 +454,7 @@ void add_window_client_surface( HWND hwnd, struct client_surface *surface )
+     surface->hwnd = hwnd;
+     list_add_tail( &client_surfaces, &surface->entry );
+     surface->funcs->update( surface );
++    refresh_client_surface_geometry( surface );
+ 
+     pthread_mutex_unlock( &surfaces_lock );
+ }
