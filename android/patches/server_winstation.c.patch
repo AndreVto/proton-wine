@@ -1,0 +1,20 @@
+diff --git a/server/winstation.c b/server/winstation.c
+index 8eaf15ec635..b9632520ed1 100644
+--- a/server/winstation.c
++++ b/server/winstation.c
+@@ -448,12 +448,14 @@ static void add_desktop_thread( struct desktop *desktop, struct thread *thread )
+ static void remove_desktop_user( struct desktop *desktop, struct thread *thread )
+ {
+     struct process *process;
++    const char *keep_desktop = getenv( "WINE_KEEP_VIRTUAL_DESKTOP" );
+ 
+     assert( desktop->users > 0 );
+     desktop->users--;
+ 
+     /* if we have one remaining user, it has to be the manager of the desktop window */
+-    if ((process = get_top_window_owner( desktop )) && desktop->users == process->running_threads && !desktop->close_timeout)
++    if ((process = get_top_window_owner( desktop )) && desktop->users == process->running_threads &&
++        !desktop->close_timeout && !(keep_desktop && keep_desktop[0] == '1' && !keep_desktop[1]))
+         desktop->close_timeout = add_timeout_user( desktop->close_timeout_val, close_desktop_timeout, desktop );
+ }
+ 

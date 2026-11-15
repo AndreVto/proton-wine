@@ -91,6 +91,7 @@ patches=(
   "dlls_ntdll_unix_esync.h.patch"
   "server_esync.c.patch"
   "server_esync.h.patch"
+  "server_winstation.c.patch"
 )
 
 for patch in "${patches[@]}"; do
