@@ -1,5 +1,5 @@
 diff --git a/dlls/win32u/opengl.c b/dlls/win32u/opengl.c
-index 03346f5..7082264 100644
+index 03346f5b5f6..86f268491f4 100644
 --- a/dlls/win32u/opengl.c
 +++ b/dlls/win32u/opengl.c
 @@ -27,6 +27,7 @@
@@ -30,7 +30,17 @@ index 03346f5..7082264 100644
      if (!fshack_enabled) return FALSE;
  
      if (xwayland_nv_cached == -1) xwayland_nv_cached = !!user_driver->pHasWindowManager( "xwayland_glx_nvidia" );
-@@ -1433,7 +1441,7 @@ static const struct opengl_driver_funcs egldrv_funcs =
+@@ -1401,6 +1409,9 @@ static BOOL egldrv_make_current( struct opengl_drawable *draw, struct opengl_dra
+ 
+     TRACE( "draw %s, read %s, context %p\n", debugstr_opengl_drawable( draw ), debugstr_opengl_drawable( read ), context );
+ 
++    if (!funcs->p_eglBindAPI( EGL_OPENGL_API ))
++        return FALSE;
++
+     return funcs->p_eglMakeCurrent( egl->display, context ? draw->surface : EGL_NO_SURFACE, context ? read->surface : EGL_NO_SURFACE, context );
+ }
+ 
+@@ -1433,7 +1444,7 @@ static const struct opengl_driver_funcs egldrv_funcs =
  static BOOL egl_init( const struct opengl_driver_funcs **driver_funcs )
  {
      struct opengl_funcs *funcs = &display_funcs;
@@ -39,7 +49,7 @@ index 03346f5..7082264 100644
  
      if (!(env = getenv( "WINE_USE_EGL" )) || !atoi( env ))
      {
-@@ -1441,9 +1449,11 @@ static BOOL egl_init( const struct opengl_driver_funcs **driver_funcs )
+@@ -1441,9 +1452,11 @@ static BOOL egl_init( const struct opengl_driver_funcs **driver_funcs )
          return FALSE;
      }
  
@@ -53,7 +63,7 @@ index 03346f5..7082264 100644
          return FALSE;
      }
  
-@@ -2350,7 +2360,7 @@ static BOOL context_sync_drawables( struct wgl_context *context, HDC draw_hdc, H
+@@ -2350,7 +2363,7 @@ static BOOL context_sync_drawables( struct wgl_context *context, HDC draw_hdc, H
                  /* On compat profile the app may use texture names without allocation. Yet it is more common to allocate
                   * the textures. So use high indexes to make it less likely that an app will want to use those directly
                   * and allocate those so these names won't be generated for app. */
